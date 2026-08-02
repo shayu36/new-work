@@ -18,3 +18,7 @@ demo
 output_ckpts
 result
 tf_logs
+.idea/
+*.so
+=2.0.0
+stp3_val

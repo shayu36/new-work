@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from skimage.draw import polygon
-from pytorch_lightning.metrics.metric import Metric
+from torchmetrics import Metric
 from stp3.utils.tools import gen_dx_bx
 from stp3.utils.geometry import calculate_birds_eye_view_parameters
 
@@ -19,7 +19,7 @@ class PlanningMetric(Metric):
         n_future=6,
         compute_on_step: bool = False,
     ):
-        super().__init__(compute_on_step=compute_on_step)
+        super().__init__()
         dx, bx, _ = gen_dx_bx([-50.0, 50.0, 0.5], [-50.0, 50.0, 0.5], [-10.0, 10.0, 20.0])
         dx, bx = dx[:2], bx[:2]
         self.dx = nn.Parameter(dx, requires_grad=False)

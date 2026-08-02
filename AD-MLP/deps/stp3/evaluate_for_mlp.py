@@ -103,7 +103,11 @@ def evaluate(final_traj_path=None, checkpoint_path=None, dataroot=None, online=F
         token_filter = pickle.load(token)
         
         for token in tqdm(token_filter):
+            if token not in final_traj:
+                continue
             final = torch.from_numpy(final_traj[token])
+            if final.shape[-1] == 2:
+                final = torch.cat([final, torch.zeros_like(final[..., :1])], dim=-1)
             gt_trajectory =  torch.tensor(gt_traj_traj[token]['gt_trajectory']).unsqueeze(0)
             occupancy = gt_traj_occup[token]
             for i in range(future_second):
@@ -122,7 +126,7 @@ def evaluate(final_traj_path=None, checkpoint_path=None, dataroot=None, online=F
 if __name__ == '__main__':
 
     online = False
-    final_traj_path = '../../paddle/model/output_data.pkl'
+    final_traj_path = '/data/jxy/projects/admlp/output_data.pkl'
     if not online:
         evaluate(final_traj_path=final_traj_path, online = False)
     else:
