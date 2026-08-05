@@ -17,6 +17,9 @@ from mmdet3d.models.detectors.loss import CE_ssc_loss, sem_scal_loss, geo_scal_l
 from mmdet3d.models.detectors.lovasz_softmax import lovasz_softmax
 from IPython import embed
 from mmdet3d.models.sparsedetectors.bbox.utils import decode_points, encode_points, trans_coords,get_matched_inds
+from mmdet3d.models.sparsedetectors.query_memory import (
+    QueryMemoryBank, EgoPoseAligner, CausalQueryMemoryAttention, ConfidenceGatedFusion
+)
 from mmdet3d.models.heads import DownScaleModule3DCustom
 from mmdet3d.core.bbox import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
 device = torch.device('cuda')
@@ -60,6 +63,16 @@ class SparseWorld4DTraj(OPUS):
                  use_focal_loss=True,
                  balance_cls_weight=True,
                  final_softplus=True,
+                 memory_enabled=False,
+                 memory_bank_size=5,
+                 memory_embed_dims=256,
+                 memory_num_heads=8,
+                 memory_dropout=0.1,
+                 memory_confidence_threshold=0.3,
+                 memory_lambda_pos=0.01,
+                 memory_lambda_time=0.1,
+                 memory_lambda_conf=0.5,
+                 memory_self_noise=0.1,
                  **kwargs):
         super(SparseWorld4DTraj, self).__init__(**kwargs)
         self.dataset_type = dataset_type
@@ -154,6 +167,26 @@ class SparseWorld4DTraj(OPUS):
         self.gt_traj = list()
         self.tau = list()
 
+        self.memory_enabled = memory_enabled
+        self.memory_self_noise = memory_self_noise
+        if self.memory_enabled:
+            self.memory_bank = QueryMemoryBank(
+                bank_size=memory_bank_size,
+                confidence_threshold=memory_confidence_threshold)
+            self.pose_aligner = EgoPoseAligner(self.pc_range)
+            self.memory_attn = CausalQueryMemoryAttention(
+                embed_dims=memory_embed_dims,
+                num_heads=memory_num_heads,
+                dropout=memory_dropout,
+                lambda_pos=memory_lambda_pos,
+                lambda_time=memory_lambda_time,
+                lambda_conf=memory_lambda_conf,
+                pc_range=self.pc_range)
+            self.memory_fusion = ConfidenceGatedFusion(
+                embed_dims=memory_embed_dims,
+                ffn_dims=memory_embed_dims * 2)
+            self._prev_scene_token = None
+
     def init_weights(self):
         self.pts_bbox_head.init_weights()
         bias_init = bias_init_with_prob(0.01)
@@ -219,6 +252,74 @@ class SparseWorld4DTraj(OPUS):
         return result
 
 
+    def _check_scene_change(self, img_metas):
+        scene_token = img_metas[0].get('scene_token', None)
+        if scene_token is not None and scene_token != self._prev_scene_token:
+            self.memory_bank.clear()
+            self._prev_scene_token = scene_token
+            return True
+        timestamp = img_metas[0].get('img_timestamp', None)
+        if timestamp is not None and len(self.memory_bank) > 0:
+            if isinstance(timestamp, (list, tuple)):
+                timestamp = timestamp[0]
+            last_ts = self.memory_bank.entries[-1].timestamp
+            if abs(timestamp - last_ts) > 2.0:
+                self.memory_bank.clear()
+                return True
+        return False
+
+    def _memory_read(self, curr_query_feat, curr_query_pos, curr_query_cls,
+                     img_metas, training=False):
+        B = curr_query_feat.shape[0]
+
+        if training:
+            mem_feat = curr_query_feat.detach()
+            if self.memory_self_noise > 0:
+                mem_feat = mem_feat + torch.randn_like(mem_feat) * self.memory_self_noise
+            mem_pos = curr_query_pos.detach()
+            mem_conf = curr_query_cls.detach().sigmoid().max(dim=-1)[0].mean(dim=-1)
+            mem_valid = mem_conf > 0.0
+            mem_time_delta = curr_query_feat.new_ones(B, mem_feat.shape[1]) * 0.5
+        else:
+            if len(self.memory_bank) == 0:
+                return curr_query_feat
+            curr_ts = img_metas[0].get('img_timestamp', 0.0)
+            if isinstance(curr_ts, (list, tuple)):
+                curr_ts = curr_ts[0]
+            mem_data = self.memory_bank.read_all(current_timestamp=curr_ts)
+            ego2global = torch.tensor(
+                np.stack([m['ego2global'] for m in img_metas]),
+                device=curr_query_feat.device, dtype=torch.float32)
+            mem_pos = self.pose_aligner(
+                mem_data['mem_pos'],
+                mem_data['mem_ego2global'],
+                ego2global,
+                mem_data['mem_sizes'])
+            mem_feat = mem_data['mem_feat']
+            mem_conf = mem_data['mem_confidence']
+            mem_valid = mem_data['mem_valid_mask']
+            mem_time_delta = mem_data['mem_time_delta']
+
+        h = self.memory_attn(
+            curr_query_feat, curr_query_pos,
+            mem_feat, mem_pos, mem_conf, mem_time_delta, mem_valid)
+        query_conf = curr_query_cls.detach().sigmoid().max(dim=-1)[0].mean(dim=-1)
+        enhanced = self.memory_fusion(
+            curr_query_feat, h, query_conf.unsqueeze(-1))
+        return enhanced
+
+    def _memory_write(self, curr_query_feat, curr_query_pos, curr_query_cls,
+                      img_metas):
+        ego2global = torch.tensor(
+            np.stack([m['ego2global'] for m in img_metas]),
+            device=curr_query_feat.device, dtype=torch.float32)
+        timestamp = img_metas[0].get('img_timestamp', 0.0)
+        if isinstance(timestamp, (list, tuple)):
+            timestamp = timestamp[0]
+        self.memory_bank.write(
+            curr_query_feat, curr_query_pos, curr_query_cls,
+            ego2global, timestamp)
+
     def forward_backbone(self,img,img_metas,**kwargs):
 
         B = img.shape[0]
@@ -248,6 +349,13 @@ class SparseWorld4DTraj(OPUS):
         outputs = dict(cls_score = curr_query_cls,
                        refine_pts = curr_query_pos,
                        outs = outs)
+
+        if self.memory_enabled:
+            curr_query_feat_raw = curr_query_feat.clone()
+            curr_query_feat = self._memory_read(
+                curr_query_feat, curr_query_pos, curr_query_cls,
+                img_metas, training=self.training)
+            outputs['_raw_query_feat'] = curr_query_feat_raw
 
         forecast_points_list = list()
         forecast_semantics_list = list()
@@ -320,8 +428,23 @@ class SparseWorld4DTraj(OPUS):
         for key in kwargs.keys():
             kwargs[key] = kwargs[key][0]
 
+        if self.memory_enabled:
+            self._check_scene_change(img_metas)
+
         outputs = self.forward_backbone(img, img_metas, **kwargs)
         cls_score, curr_query_pos, outs = outputs['cls_score'],outputs['refine_pts'],outputs['outs']
+
+        if self.memory_enabled:
+            raw_feat = outputs.get('_raw_query_feat', None)
+            if raw_feat is None:
+                raw_cls = outs['all_cls_scores'][-1][:, self.pts_bbox_head.ind_stamps_all == 0]
+                raw_pos = outs['all_refine_pts'][-1][:, self.pts_bbox_head.ind_stamps_all == 0]
+                raw_feat_for_write = outs['query_feat'][:, self.pts_bbox_head.ind_stamps_all == 0]
+            else:
+                raw_feat_for_write = raw_feat
+                raw_pos = curr_query_pos
+                raw_cls = cls_score
+            self._memory_write(raw_feat_for_write, raw_pos, raw_cls, img_metas)
 
         pred_dict = dict(cls_scores=outs['all_cls_scores'][-1][:,self.pts_bbox_head.ind_stamps_all==0], refine_pts=outs['all_refine_pts'][-1][:,self.pts_bbox_head.ind_stamps_all==0])
         occ_pred = self.pts_bbox_head.get_occ(pred_dict)[0]

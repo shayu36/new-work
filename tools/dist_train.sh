@@ -9,7 +9,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 # export NCCL_P2P_DISABLE=1
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-torchrun \
+/data/jxy/projects/env/bin/torchrun \
     --nproc_per_node=$GPUS \
     --master_port=$MASTER_PORT \
     $(dirname "$0")/train.py \

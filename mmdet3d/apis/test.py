@@ -83,60 +83,92 @@ def merge_images(image_list, gap_width=10, size=[500,800]):
 
 def multi_gpu_test(model, data_loader, dump_dir=None, tmpdir=None, gpu_collect=False):
     model.eval()
-    results = []
+    occ_results = []
+    traj_results = []
+    has_traj = False
     dataset = data_loader.dataset
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
-        # debug
-        # prog_bar = mmcv.ProgressBar(5)
-    time.sleep(2)  # This line can prevent deadlock problem in some cases.
+    time.sleep(2)
     for i, data in enumerate(data_loader):
-        # debug
-        # if i >= 5:
-            # break
-        
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
-        
-        # result = result['geo_occ']
-        result = result['semantic_occ']
 
-        if dump_dir is not None:
-            scene_name = data['img_metas'][0].data[0][0]['scene_name']
-            frame_idx = data['img_metas'][0].data[0][0]['sample_idx']
+        if result.get('semantic_occ_4s', None) is not None:
+            occ = np.stack([
+                result['semantic_occ_0s'][0],
+                result['semantic_occ_2s'][0],
+                result['semantic_occ_4s'][0],
+                result['semantic_occ_6s'][0],
+            ], axis=0).astype(np.uint8)
+            occ_results.append(occ)
+            traj_results.append(result['pred_traj'].cpu())
+            has_traj = True
+        elif result.get('semantic_occ_0s', None) is not None:
+            occ = np.stack([result['semantic_occ_0s'][0]], axis=0).astype(np.uint8)
+            occ_results.append(occ)
+        else:
+            occ_results.append(result['semantic_occ'])
 
-            # if (scene_name == 'scene-0634' and frame_idx == '8f88eeb853ff4fb5a88e03e44bf8fa28') or (scene_name == 'scene-1059' and frame_idx == 'd8c1640ec61545e59e843c68cce3833e'):
-            #     print('Hit!')
-            # dump occupancy prediction
-            save_path = os.path.join(dump_dir, scene_name)
-            os.makedirs(save_path, exist_ok=True)
-            np.save(os.path.join(save_path, '%s.npy'%frame_idx), result)
-
-            # dump images
-            # imgs = data['img_inputs'][0][0][0]
-            # TN, C, H, W = imgs.shape
-            # imgs = imgs.reshape(6, TN//6, C, H, W)[:,0,...]    # select key frame only
-            # imgs = imgs.cpu().numpy().transpose(0,2,3,1)
-            # image_list = [imgs[0], imgs[1], imgs[2],
-            #                 imgs[5][:,::-1,:], imgs[4][:,::-1,:], imgs[3][:,::-1,:]
-            #                 ]
-            # image_list = reverse_norm(image_list)
-            # img_merged = merge_images(image_list, gap_width=10, size=[500,800])
-            # cv2.imwrite(os.path.join(save_path, '%s.png'%frame_idx), img_merged)
-
-        results.extend(result)
         if rank == 0:
-            batch_size = len(result)
-            for _ in range(batch_size * world_size):
+            for _ in range(world_size):
                 prog_bar.update()
-                
-    # collect results from all ranks
-    if gpu_collect:
-        results = collect_results_gpu(results, len(dataset))
-    else:
-        results = collect_results_cpu(results, len(dataset), tmpdir)
-    return results
+
+    save_dir = '.dist_test'
+    mmcv.mkdir_or_exist(save_dir)
+    mmcv.dump(occ_results, osp.join(save_dir, f'occ_part_{rank}.pkl'))
+    if has_traj:
+        mmcv.dump(traj_results, osp.join(save_dir, f'traj_part_{rank}.pkl'))
+    del occ_results, traj_results
+    dist.barrier()
+
+    if rank != 0:
+        return None
+
+    all_occ = []
+    all_traj = [] if has_traj else None
+    for r in range(world_size):
+        part_occ = mmcv.load(osp.join(save_dir, f'occ_part_{r}.pkl'))
+        if has_traj:
+            part_traj = mmcv.load(osp.join(save_dir, f'traj_part_{r}.pkl'))
+        if r == 0:
+            all_occ = [[x] for x in part_occ]
+            if has_traj:
+                all_traj = [[x] for x in part_traj]
+        else:
+            for j, x in enumerate(part_occ):
+                if j < len(all_occ):
+                    all_occ[j].append(x)
+                else:
+                    all_occ.append([x])
+            if has_traj:
+                for j, x in enumerate(part_traj):
+                    if j < len(all_traj):
+                        all_traj[j].append(x)
+                    else:
+                        all_traj.append([x])
+        del part_occ
+        if has_traj:
+            del part_traj
+
+    ordered_occ = []
+    for group in all_occ:
+        ordered_occ.extend(group)
+    ordered_occ = ordered_occ[:len(dataset)]
+    del all_occ
+
+    if has_traj:
+        ordered_traj = []
+        for group in all_traj:
+            ordered_traj.extend(group)
+        ordered_traj = ordered_traj[:len(dataset)]
+        del all_traj
+        shutil.rmtree(save_dir, ignore_errors=True)
+        return [ordered_occ, ordered_traj]
+
+    shutil.rmtree(save_dir, ignore_errors=True)
+    return [ordered_occ]
 
 
 def collect_results_cpu(result_part, size, tmpdir=None):
