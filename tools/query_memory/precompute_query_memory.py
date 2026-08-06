@@ -161,6 +161,27 @@ def unwrap_img_metas(data):
     return img_metas
 
 
+def unwrap_data_value(value):
+    if hasattr(value, 'data'):
+        value = value.data[0]
+    return value
+
+
+def run_sparseworld_rap_prefix(model, img, img_metas, data):
+    """Run the same RAP prefix used by SparseWorld forward_backbone."""
+    temporal_ego_states = unwrap_data_value(data['temporal_ego_states'])
+    ego_states = temporal_ego_states[0]
+    bs, _, dim_ = ego_states.shape
+    ego_states = ego_states.view((bs, 1, dim_))
+    ego_feat = model.plan_head(ego_states)
+    points_scale = model.points_scale_branch(ego_feat)
+    points_scale = torch.tanh(points_scale)
+    model.pts_bbox_head.points_scale = (
+        (points_scale + 1) / 2 * (1.5 - 0.8) + 0.8)
+    img_feats = model.extract_feat(img, img_metas)
+    return model.pts_bbox_head(img_feats, img_metas)
+
+
 def main():
     args = parse_args()
     cfg = Config.fromfile(args.config)
@@ -184,8 +205,7 @@ def main():
             if len(img_metas) != 1:
                 raise RuntimeError('precompute_query_memory requires batch_size=1')
             img = data['img'].cuda(non_blocking=True)
-            img_feats = model.extract_feat(img, img_metas)
-            outs = model.pts_bbox_head(img_feats, img_metas)
+            outs = run_sparseworld_rap_prefix(model, img, img_metas, data)
             cache = build_cache_record(model, outs, img_metas[0], args)
             path = output_path(output_dir, cache['scene_id'], cache['sample_idx'])
             if path.exists() and not args.overwrite:

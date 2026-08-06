@@ -316,6 +316,12 @@ def train_detector(model,
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from,revise_keys=cfg.get('revise_keys',[(r'^module.', '')]))
+    if hasattr(runner.model, 'module'):
+        model_for_checks = runner.model.module
+    else:
+        model_for_checks = runner.model
+    if hasattr(model_for_checks, 'validate_query_memory_training_setup'):
+        model_for_checks.validate_query_memory_training_setup()
     runner.run(data_loaders, cfg.workflow)
 
 

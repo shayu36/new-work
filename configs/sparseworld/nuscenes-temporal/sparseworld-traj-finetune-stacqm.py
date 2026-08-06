@@ -331,8 +331,8 @@ custom_hooks = [dict(type='CustomSetEpochInfoHook')]
 log_config = dict(
     interval=50,
 )
-load_from="ckpts/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth"
+load_from='ckpts/epoch_56.pth'
 
-revise_keys = [('backbone','img_backbone')]
+revise_keys = [(r'^module.', '')]
 
 # fp16 = dict(loss_scale='dynamic')

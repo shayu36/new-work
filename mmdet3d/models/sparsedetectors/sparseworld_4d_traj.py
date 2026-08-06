@@ -13,6 +13,7 @@ import numpy as np
 from mmdet3d.models import builder
 from .opus_transformer import OPUSSelfAttention, OPUSCrossAttention
 from mmcv.cnn import bias_init_with_prob
+from mmcv.runner import get_dist_info
 from mmdet3d.models.detectors.loss import CE_ssc_loss, sem_scal_loss, geo_scal_loss, l1_loss, l2_loss
 from mmdet3d.models.detectors.lovasz_softmax import lovasz_softmax
 from IPython import embed
@@ -75,7 +76,7 @@ class SparseWorld4DTraj(OPUS):
                  memory_lambda_conf=0.5,
                  query_memory_cfg=None,
                  **kwargs):
-        kwargs.pop('memory_self_noise', None)
+        self.memory_self_noise = kwargs.pop('memory_self_noise', 0.0)
         super(SparseWorld4DTraj, self).__init__(**kwargs)
         self.dataset_type = dataset_type
         self.out_dim = out_dim
@@ -321,6 +322,27 @@ class SparseWorld4DTraj(OPUS):
         for name, param in self.named_parameters():
             param.requires_grad = name.startswith('query_memory.')
 
+    def validate_query_memory_training_setup(self):
+        if not self.query_memory_enabled:
+            return
+        if self.query_memory_source == 'online' and self.training:
+            raise RuntimeError(
+                'STAC-QM online memory is for single-GPU sequential eval only; '
+                'training must use query_memory_cfg.source="cache".')
+        if self.query_memory_cfg.get('freeze_base_model', False):
+            trainable = [
+                name for name, param in self.named_parameters()
+                if param.requires_grad
+            ]
+            bad = [name for name in trainable if not name.startswith('query_memory.')]
+            if bad:
+                raise RuntimeError(
+                    'freeze_base_model=True allows only query_memory.* to be '
+                    f'trainable, but found: {bad[:20]}')
+            if not trainable:
+                raise RuntimeError(
+                    'freeze_base_model=True left no trainable parameters.')
+
     def _meta_scene_id(self, meta):
         scene_id = meta.get('scene_token', None)
         if scene_id is None:
@@ -382,7 +404,7 @@ class SparseWorld4DTraj(OPUS):
             ]
             missing = [key for key in required if key not in kwargs]
             if missing:
-                raise KeyError(
+                raise RuntimeError(
                     'query_memory_cfg.source="cache" requires cache loader '
                     f'fields, missing: {missing}')
             return dict(
@@ -401,8 +423,18 @@ class SparseWorld4DTraj(OPUS):
 
         if self.training:
             raise RuntimeError(
-                'STAC-QM online bank is inference-only; training must use '
-                'offline query cache, not previous batches')
+                'STAC-QM online memory training is disabled; use cache memory '
+                'for training or disable query_memory_cfg.')
+        _, world_size = get_dist_info()
+        if world_size != 1:
+            raise RuntimeError(
+                'STAC-QM online bank requires single-GPU sequential eval; '
+                f'got world_size={world_size}')
+        _, world_size = get_dist_info()
+        if world_size != 1:
+            raise RuntimeError(
+                'STAC-QM online bank requires single-GPU sequential eval; '
+                f'got world_size={world_size}')
         if len(img_metas) != 1:
             raise RuntimeError(
                 'STAC-QM online bank only supports batch_size=1; got '

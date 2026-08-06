@@ -94,7 +94,14 @@ class LoadQueryMemoryFromFiles(object):
                 return path
         return paths[0]
 
-    def _validate_cache(self, cache, path):
+    def _hist_scene_id(self, hist):
+        return hist.get('scene_id', hist.get('scene_token', hist.get('scene_name')))
+
+    def _hist_sample_idx(self, hist):
+        return hist.get('sample_idx', hist.get('sample_token', hist.get('token')))
+
+    def _validate_cache(self, cache, path, hist=None, current_ts=None,
+                        current_frame=None):
         required = [
             'schema_version', 'sample_idx', 'scene_id', 'frame_idx',
             'timestamp', 'ego2global', 'query_feat', 'query_points_metric',
@@ -126,6 +133,32 @@ class LoadQueryMemoryFromFiles(object):
             raise ValueError(f'{path} query_feat/valid_mask M mismatch')
         if tuple(ego2global.shape) != (4, 4):
             raise ValueError(f'{path} ego2global must be [4, 4]')
+        if hist is None:
+            return
+        hist_scene = self._hist_scene_id(hist)
+        hist_sample = self._hist_sample_idx(hist)
+        hist_frame = hist.get('frame_idx', None)
+        hist_ts = hist.get('timestamp', None)
+        if hist_scene is not None and str(cache['scene_id']) != str(hist_scene):
+            raise ValueError(
+                f'{path} scene_id mismatch: cache={cache["scene_id"]}, '
+                f'history={hist_scene}')
+        if hist_sample is not None and str(cache['sample_idx']) != str(hist_sample):
+            raise ValueError(
+                f'{path} sample_idx mismatch: cache={cache["sample_idx"]}, '
+                f'history={hist_sample}')
+        if hist_frame is not None and int(cache['frame_idx']) != int(hist_frame):
+            raise ValueError(
+                f'{path} frame_idx mismatch: cache={cache["frame_idx"]}, '
+                f'history={hist_frame}')
+        if hist_ts is not None and float(cache['timestamp']) != float(hist_ts):
+            raise ValueError(
+                f'{path} timestamp mismatch: cache={cache["timestamp"]}, '
+                f'history={hist_ts}')
+        if current_frame is not None and int(cache['frame_idx']) >= int(current_frame):
+            raise ValueError(f'{path} is not causal for current frame_idx')
+        if current_ts is not None and float(cache['timestamp']) >= float(current_ts):
+            raise ValueError(f'{path} is not causal for current timestamp')
 
     def _select_top_queries(self, cache):
         feat = cache['query_feat'].detach().cpu()
@@ -198,7 +231,9 @@ class LoadQueryMemoryFromFiles(object):
                     loaded.append((hist, path, None))
                     continue
                 cache = torch.load(path, map_location='cpu')
-                self._validate_cache(cache, path)
+                self._validate_cache(
+                    cache, path, hist=hist, current_ts=current_ts,
+                    current_frame=_frame_idx(results))
                 loaded.append((hist, path, cache))
 
         first_cache = next((cache for _, _, cache in loaded if cache is not None), None)
