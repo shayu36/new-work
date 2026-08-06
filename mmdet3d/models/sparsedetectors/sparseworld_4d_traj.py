@@ -18,7 +18,8 @@ from mmdet3d.models.detectors.lovasz_softmax import lovasz_softmax
 from IPython import embed
 from mmdet3d.models.sparsedetectors.bbox.utils import decode_points, encode_points, trans_coords,get_matched_inds
 from mmdet3d.models.sparsedetectors.query_memory import (
-    QueryMemoryBank, EgoPoseAligner, CausalQueryMemoryAttention, ConfidenceGatedFusion
+    STACQueryMemory, QueryMemoryBank, decode_points_metric,
+    logits_to_query_confidence
 )
 from mmdet3d.models.heads import DownScaleModule3DCustom
 from mmdet3d.core.bbox import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
@@ -72,8 +73,9 @@ class SparseWorld4DTraj(OPUS):
                  memory_lambda_pos=0.01,
                  memory_lambda_time=0.1,
                  memory_lambda_conf=0.5,
-                 memory_self_noise=0.1,
+                 query_memory_cfg=None,
                  **kwargs):
+        kwargs.pop('memory_self_noise', None)
         super(SparseWorld4DTraj, self).__init__(**kwargs)
         self.dataset_type = dataset_type
         self.out_dim = out_dim
@@ -167,25 +169,61 @@ class SparseWorld4DTraj(OPUS):
         self.gt_traj = list()
         self.tau = list()
 
-        self.memory_enabled = memory_enabled
-        self.memory_self_noise = memory_self_noise
-        if self.memory_enabled:
-            self.memory_bank = QueryMemoryBank(
-                bank_size=memory_bank_size,
-                confidence_threshold=memory_confidence_threshold)
-            self.pose_aligner = EgoPoseAligner(self.pc_range)
-            self.memory_attn = CausalQueryMemoryAttention(
-                embed_dims=memory_embed_dims,
-                num_heads=memory_num_heads,
-                dropout=memory_dropout,
-                lambda_pos=memory_lambda_pos,
-                lambda_time=memory_lambda_time,
-                lambda_conf=memory_lambda_conf,
+        legacy_memory_cfg = dict(
+            enabled=memory_enabled,
+            source='online',
+            history_frames=memory_bank_size,
+            max_queries_per_frame=256,
+            write_threshold=memory_confidence_threshold,
+            embed_dims=memory_embed_dims,
+            num_heads=memory_num_heads,
+            spatial_radius=12.0,
+            topk=32,
+            max_age=3.0,
+            lambda_position=memory_lambda_pos,
+            lambda_time=memory_lambda_time,
+            lambda_confidence=memory_lambda_conf,
+            dropout=memory_dropout,
+            max_time_gap=2.0,
+            log_diagnostics=False,
+            freeze_base_model=False,
+        )
+        self.query_memory_cfg = self._build_query_memory_cfg(
+            query_memory_cfg, legacy_memory_cfg)
+        self.query_memory_enabled = bool(self.query_memory_cfg.get('enabled', False))
+        self.memory_enabled = self.query_memory_enabled
+        self.query_memory_source = self.query_memory_cfg.get('source', 'cache')
+        self.query_memory_log_diagnostics = bool(
+            self.query_memory_cfg.get('log_diagnostics', False))
+        self.query_memory_diagnostics = []
+        self.query_memory = None
+        self.query_memory_bank = None
+        if self.query_memory_enabled:
+            if self.query_memory_source not in ('cache', 'online'):
+                raise ValueError(
+                    'query_memory_cfg.source must be "cache" or "online", '
+                    f'got {self.query_memory_source!r}')
+            self.query_memory = STACQueryMemory(
+                enabled=True,
+                embed_dims=self.query_memory_cfg['embed_dims'],
+                num_heads=self.query_memory_cfg['num_heads'],
+                spatial_radius=self.query_memory_cfg['spatial_radius'],
+                topk=self.query_memory_cfg['topk'],
+                max_age=self.query_memory_cfg['max_age'],
+                lambda_position=self.query_memory_cfg['lambda_position'],
+                lambda_time=self.query_memory_cfg['lambda_time'],
+                lambda_confidence=self.query_memory_cfg['lambda_confidence'],
+                dropout=self.query_memory_cfg['dropout'],
                 pc_range=self.pc_range)
-            self.memory_fusion = ConfidenceGatedFusion(
-                embed_dims=memory_embed_dims,
-                ffn_dims=memory_embed_dims * 2)
-            self._prev_scene_token = None
+            if self.query_memory_source == 'online':
+                self.query_memory_bank = QueryMemoryBank(
+                    history_frames=self.query_memory_cfg['history_frames'],
+                    max_queries_per_frame=self.query_memory_cfg[
+                        'max_queries_per_frame'],
+                    write_threshold=self.query_memory_cfg['write_threshold'],
+                    max_time_gap=self.query_memory_cfg.get('max_time_gap'))
+        if self.query_memory_cfg.get('freeze_base_model', False):
+            self._freeze_base_for_query_memory()
 
     def init_weights(self):
         self.pts_bbox_head.init_weights()
@@ -252,73 +290,209 @@ class SparseWorld4DTraj(OPUS):
         return result
 
 
-    def _check_scene_change(self, img_metas):
-        scene_token = img_metas[0].get('scene_token', None)
-        if scene_token is not None and scene_token != self._prev_scene_token:
-            self.memory_bank.clear()
-            self._prev_scene_token = scene_token
-            return True
-        timestamp = img_metas[0].get('img_timestamp', None)
-        if timestamp is not None and len(self.memory_bank) > 0:
-            if isinstance(timestamp, (list, tuple)):
-                timestamp = timestamp[0]
-            last_ts = self.memory_bank.entries[-1].timestamp
-            if abs(timestamp - last_ts) > 2.0:
-                self.memory_bank.clear()
-                return True
-        return False
+    def _build_query_memory_cfg(self, query_memory_cfg, legacy_cfg):
+        cfg = dict(
+            enabled=False,
+            source='cache',
+            history_frames=3,
+            max_queries_per_frame=256,
+            write_threshold=0.35,
+            embed_dims=256,
+            num_heads=8,
+            spatial_radius=12.0,
+            topk=32,
+            max_age=3.0,
+            lambda_position=1.0,
+            lambda_time=1.0,
+            lambda_confidence=1.0,
+            dropout=0.0,
+            max_time_gap=None,
+            log_diagnostics=False,
+            freeze_base_model=False,
+        )
+        if query_memory_cfg is None:
+            if legacy_cfg.get('enabled', False):
+                cfg.update(legacy_cfg)
+            return cfg
+        cfg.update(query_memory_cfg)
+        return cfg
 
-    def _memory_read(self, curr_query_feat, curr_query_pos, curr_query_cls,
-                     img_metas, training=False):
-        B = curr_query_feat.shape[0]
+    def _freeze_base_for_query_memory(self):
+        for name, param in self.named_parameters():
+            param.requires_grad = name.startswith('query_memory.')
 
-        if training:
-            mem_feat = curr_query_feat.detach()
-            if self.memory_self_noise > 0:
-                mem_feat = mem_feat + torch.randn_like(mem_feat) * self.memory_self_noise
-            mem_pos = curr_query_pos.detach()
-            mem_conf = curr_query_cls.detach().sigmoid().max(dim=-1)[0].mean(dim=-1)
-            mem_valid = mem_conf > 0.0
-            mem_time_delta = curr_query_feat.new_ones(B, mem_feat.shape[1]) * 0.5
-        else:
-            if len(self.memory_bank) == 0:
-                return curr_query_feat
-            curr_ts = img_metas[0].get('img_timestamp', 0.0)
-            if isinstance(curr_ts, (list, tuple)):
-                curr_ts = curr_ts[0]
-            mem_data = self.memory_bank.read_all(current_timestamp=curr_ts)
-            ego2global = torch.tensor(
-                np.stack([m['ego2global'] for m in img_metas]),
-                device=curr_query_feat.device, dtype=torch.float32)
-            mem_pos = self.pose_aligner(
-                mem_data['mem_pos'],
-                mem_data['mem_ego2global'],
-                ego2global,
-                mem_data['mem_sizes'])
-            mem_feat = mem_data['mem_feat']
-            mem_conf = mem_data['mem_confidence']
-            mem_valid = mem_data['mem_valid_mask']
-            mem_time_delta = mem_data['mem_time_delta']
+    def _meta_scene_id(self, meta):
+        scene_id = meta.get('scene_token', None)
+        if scene_id is None:
+            scene_id = meta.get('scene_name', meta.get('scene_id', None))
+        return None if scene_id is None else str(scene_id)
 
-        h = self.memory_attn(
-            curr_query_feat, curr_query_pos,
-            mem_feat, mem_pos, mem_conf, mem_time_delta, mem_valid)
-        query_conf = curr_query_cls.detach().sigmoid().max(dim=-1)[0].mean(dim=-1)
-        enhanced = self.memory_fusion(
-            curr_query_feat, h, query_conf.unsqueeze(-1))
-        return enhanced
+    def _meta_sample_idx(self, meta):
+        sample_idx = meta.get('sample_idx', meta.get('sample_token', None))
+        return None if sample_idx is None else str(sample_idx)
+
+    def _meta_frame_idx(self, meta):
+        frame_idx = meta.get('frame_idx', None)
+        if frame_idx is None and 'curr' in meta:
+            frame_idx = meta['curr'].get('frame_idx', None)
+        return None if frame_idx is None else int(frame_idx)
+
+    def _meta_timestamp(self, meta):
+        timestamp = meta.get('timestamp', None)
+        if timestamp is None:
+            timestamp = meta.get('img_timestamp', None)
+        if isinstance(timestamp, (list, tuple)):
+            timestamp = timestamp[0]
+        if isinstance(timestamp, torch.Tensor):
+            timestamp = timestamp.detach().cpu().reshape(-1)[0].item()
+        if timestamp is None:
+            raise KeyError('timestamp or img_timestamp is required for STAC-QM')
+        return float(timestamp)
+
+    def _current_ego2global_tensor(self, img_metas, device):
+        ego2globals = []
+        for meta in img_metas:
+            if 'ego2global' not in meta:
+                raise KeyError('ego2global is required for STAC-QM alignment')
+            value = meta['ego2global']
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            ego2globals.append(np.asarray(value, dtype=np.float32))
+        return torch.tensor(
+            np.stack(ego2globals), device=device, dtype=torch.float32)
+
+    def _tensor_from_memory_kwargs(self, kwargs, key, device, dtype=None):
+        value = kwargs[key]
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        value = value.to(device=device)
+        if dtype is not None:
+            value = value.to(dtype=dtype)
+        return value
+
+    def _query_memory_context(self, kwargs, img_metas, device, dtype):
+        if not self.query_memory_enabled:
+            return None
+        if self.query_memory_source == 'cache':
+            required = [
+                'memory_query_feat', 'memory_points_metric', 'memory_conf',
+                'memory_valid', 'memory_source_ego2global', 'memory_age'
+            ]
+            missing = [key for key in required if key not in kwargs]
+            if missing:
+                raise KeyError(
+                    'query_memory_cfg.source="cache" requires cache loader '
+                    f'fields, missing: {missing}')
+            return dict(
+                memory_query_feat=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_query_feat', device, dtype),
+                memory_points_metric=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_points_metric', device, dtype),
+                memory_conf=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_conf', device, torch.float32),
+                memory_valid=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_valid', device).bool(),
+                memory_source_ego2global=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_source_ego2global', device, torch.float32),
+                memory_age=self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_age', device, torch.float32))
+
+        if self.training:
+            raise RuntimeError(
+                'STAC-QM online bank is inference-only; training must use '
+                'offline query cache, not previous batches')
+        if len(img_metas) != 1:
+            raise RuntimeError(
+                'STAC-QM online bank only supports batch_size=1; got '
+                f'{len(img_metas)} samples')
+        meta = img_metas[0]
+        return self.query_memory_bank.read(
+            scene_id=self._meta_scene_id(meta),
+            sample_idx=self._meta_sample_idx(meta),
+            frame_idx=self._meta_frame_idx(meta),
+            timestamp=self._meta_timestamp(meta),
+            device=device,
+            dtype=dtype)
+
+    def _apply_query_memory_once(self, query_feat, query_pos, query_cls,
+                                 img_metas, memory_context):
+        if not self.query_memory_enabled:
+            return query_feat
+        if memory_context is None:
+            return query_feat
+        query_points_metric = decode_points_metric(query_pos, self.pc_range)
+        query_conf = logits_to_query_confidence(query_cls.detach())
+        target_ego2global = self._current_ego2global_tensor(
+            img_metas, query_feat.device)
+        fused, diagnostics = self.query_memory(
+            query_feat=query_feat,
+            query_points_metric=query_points_metric,
+            current_confidence=query_conf,
+            memory=memory_context,
+            target_ego2global=target_ego2global)
+        if self.query_memory_log_diagnostics:
+            self.query_memory_diagnostics.append({
+                key: value.detach().cpu() if isinstance(value, torch.Tensor)
+                else value
+                for key, value in diagnostics.items()
+            })
+        return fused
+
+    def _prepare_online_query_memory(self, img_metas):
+        if not self.query_memory_enabled or self.query_memory_source != 'online':
+            return
+        if len(img_metas) != 1:
+            raise RuntimeError(
+                'STAC-QM online bank only supports batch_size=1; got '
+                f'{len(img_metas)} samples')
+        meta = img_metas[0]
+        scene_id = self._meta_scene_id(meta)
+        frame_idx = self._meta_frame_idx(meta)
+        timestamp = self._meta_timestamp(meta)
+        bank = self.query_memory_bank
+        if bank._last_scene_id is not None and scene_id != bank._last_scene_id:
+            bank.clear()
+            return
+        if frame_idx is not None and bank._last_frame_idx is not None:
+            if frame_idx < bank._last_frame_idx:
+                bank.clear()
+                return
+        if timestamp is not None and bank._last_timestamp is not None:
+            if timestamp < bank._last_timestamp:
+                bank.clear()
+                return
+            max_time_gap = self.query_memory_cfg.get('max_time_gap', None)
+            if max_time_gap is not None:
+                if timestamp - bank._last_timestamp > float(max_time_gap):
+                    bank.clear()
 
     def _memory_write(self, curr_query_feat, curr_query_pos, curr_query_cls,
                       img_metas):
-        ego2global = torch.tensor(
-            np.stack([m['ego2global'] for m in img_metas]),
-            device=curr_query_feat.device, dtype=torch.float32)
-        timestamp = img_metas[0].get('img_timestamp', 0.0)
-        if isinstance(timestamp, (list, tuple)):
-            timestamp = timestamp[0]
-        self.memory_bank.write(
-            curr_query_feat, curr_query_pos, curr_query_cls,
-            ego2global, timestamp)
+        if not self.query_memory_enabled or self.query_memory_source != 'online':
+            return
+        if curr_query_feat.shape[0] != 1:
+            raise RuntimeError(
+                'STAC-QM online bank only supports batch_size=1; got '
+                f'B={curr_query_feat.shape[0]}')
+        meta = img_metas[0]
+        ego2global = self._current_ego2global_tensor(
+            img_metas, curr_query_feat.device)
+        points_metric = decode_points_metric(curr_query_pos, self.pc_range)
+        self.query_memory_bank.write(
+            curr_query_feat,
+            points_metric,
+            cls_scores=curr_query_cls,
+            ego2global=ego2global,
+            timestamp=self._meta_timestamp(meta),
+            scene_id=self._meta_scene_id(meta),
+            sample_idx=self._meta_sample_idx(meta),
+            frame_idx=self._meta_frame_idx(meta))
+
+    def _check_scene_change(self, img_metas):
+        self._prepare_online_query_memory(img_metas)
+        return False
 
     def forward_backbone(self,img,img_metas,**kwargs):
 
@@ -344,18 +518,23 @@ class SparseWorld4DTraj(OPUS):
 
         curr_query_feat = query_feat[:, ind_stamps_all == 0]
         curr_query_pos = query_pos[:, ind_stamps_all == 0].detach()
-        curr_query_timestamp = query_pos.new_zeros(B,self.num_query,self.num_refines,1)
-        curr_query_cls = query_cls[:,ind_stamps_all==0]
-        outputs = dict(cls_score = curr_query_cls,
-                       refine_pts = curr_query_pos,
-                       outs = outs)
+        curr_query_timestamp = query_pos.new_zeros(
+            B, curr_query_feat.shape[1], self.num_refines, 1)
+        curr_query_cls = query_cls[:, ind_stamps_all == 0]
+        curr_query_cls_for_memory = curr_query_cls
+        outputs = dict(cls_score=curr_query_cls,
+                       refine_pts=curr_query_pos,
+                       outs=outs)
 
-        if self.memory_enabled:
-            curr_query_feat_raw = curr_query_feat.clone()
-            curr_query_feat = self._memory_read(
-                curr_query_feat, curr_query_pos, curr_query_cls,
-                img_metas, training=self.training)
-            outputs['_raw_query_feat'] = curr_query_feat_raw
+        if self.query_memory_enabled:
+            outputs['_raw_query_feat'] = curr_query_feat.clone()
+            outputs['_raw_query_pos'] = curr_query_pos.clone()
+            outputs['_raw_query_cls'] = curr_query_cls.clone()
+            memory_context = self._query_memory_context(
+                kwargs, img_metas, curr_query_feat.device,
+                curr_query_feat.dtype)
+        else:
+            memory_context = None
 
         forecast_points_list = list()
         forecast_semantics_list = list()
@@ -368,22 +547,40 @@ class SparseWorld4DTraj(OPUS):
 
         for interval in range(num_fu_frames):
             # fu_query_feat = outs['fu_query_feat'].reshape(B,self.num_fu_frames,self.num_fu_query,self.out_dim)
+            curr_query_feat = self._apply_query_memory_once(
+                curr_query_feat, curr_query_pos, curr_query_cls_for_memory,
+                img_metas, memory_context)
             fused_ego_feat,_ = self.ego_cross_attn(ego_feat.new_ones(B, 1, 3)*0.5, ego_feat, curr_query_pos.detach(),
                                                     curr_query_feat.detach(), )
             pred_traj = self.traj_head(fused_ego_feat)
             pred_trajs_list.append(pred_traj)
 
-            curr_query_feat = torch.cat([curr_query_feat, query_feat[:, ind_stamps_all == interval + 1]], dim=1)
-            curr_query_pos = torch.cat([curr_query_pos, query_pos[:, ind_stamps_all == interval + 1]],
-                                          dim=1).detach()
-            if interval<6:
-                curr_query_timestamp = torch.cat([curr_query_timestamp,curr_query_pos.new_ones(B,self.num_fu_query[interval],self.num_refines,1)*0.5],dim=1)
+            scheduled_mask = ind_stamps_all == interval + 1
+            scheduled_feat = query_feat[:, scheduled_mask]
+            scheduled_pos = query_pos[:, scheduled_mask].detach()
+            scheduled_cls = query_cls[:, scheduled_mask]
+            if scheduled_feat.shape[1] > 0:
+                scheduled_feat = self._apply_query_memory_once(
+                    scheduled_feat, scheduled_pos, scheduled_cls, img_metas,
+                    memory_context)
+                curr_query_feat = torch.cat(
+                    [curr_query_feat, scheduled_feat], dim=1)
+                curr_query_pos = torch.cat(
+                    [curr_query_pos, scheduled_pos], dim=1).detach()
+                curr_query_cls_for_memory = torch.cat(
+                    [curr_query_cls_for_memory, scheduled_cls], dim=1)
+                curr_query_timestamp = torch.cat([
+                    curr_query_timestamp,
+                    curr_query_pos.new_ones(
+                        B, scheduled_feat.shape[1], self.num_refines, 1) * 0.5
+                ], dim=1)
 
             pos_embedding = self.position_encoder(torch.cat([curr_query_pos,curr_query_timestamp],dim=-1).flatten(2,3))
             curr_query_feat = curr_query_feat + fused_ego_feat + pos_embedding
 
             reg_offset = self.reg_branch(curr_query_feat).unflatten(-1, (-1, 3)) * 0.5
             cls_score = self.cls_branch(curr_query_feat).unflatten(-1, (-1, 17))
+            curr_query_cls_for_memory = cls_score
             vel_offset = self.vel_branch(curr_query_feat).unflatten(-1, (-1, 2))
             #
             pred_labels = cls_score.argmax(-1)
@@ -428,23 +625,21 @@ class SparseWorld4DTraj(OPUS):
         for key in kwargs.keys():
             kwargs[key] = kwargs[key][0]
 
-        if self.memory_enabled:
-            self._check_scene_change(img_metas)
+        if self.query_memory_enabled and self.query_memory_source == 'online':
+            self._prepare_online_query_memory(img_metas)
 
         outputs = self.forward_backbone(img, img_metas, **kwargs)
         cls_score, curr_query_pos, outs = outputs['cls_score'],outputs['refine_pts'],outputs['outs']
 
-        if self.memory_enabled:
-            raw_feat = outputs.get('_raw_query_feat', None)
-            if raw_feat is None:
+        if self.query_memory_enabled and self.query_memory_source == 'online':
+            raw_feat = outputs.get('_raw_query_feat')
+            raw_pos = outputs.get('_raw_query_pos')
+            raw_cls = outputs.get('_raw_query_cls')
+            if raw_feat is None or raw_pos is None or raw_cls is None:
                 raw_cls = outs['all_cls_scores'][-1][:, self.pts_bbox_head.ind_stamps_all == 0]
                 raw_pos = outs['all_refine_pts'][-1][:, self.pts_bbox_head.ind_stamps_all == 0]
-                raw_feat_for_write = outs['query_feat'][:, self.pts_bbox_head.ind_stamps_all == 0]
-            else:
-                raw_feat_for_write = raw_feat
-                raw_pos = curr_query_pos
-                raw_cls = cls_score
-            self._memory_write(raw_feat_for_write, raw_pos, raw_cls, img_metas)
+                raw_feat = outs['query_feat'][:, self.pts_bbox_head.ind_stamps_all == 0]
+            self._memory_write(raw_feat, raw_pos, raw_cls, img_metas)
 
         pred_dict = dict(cls_scores=outs['all_cls_scores'][-1][:,self.pts_bbox_head.ind_stamps_all==0], refine_pts=outs['all_refine_pts'][-1][:,self.pts_bbox_head.ind_stamps_all==0])
         occ_pred = self.pts_bbox_head.get_occ(pred_dict)[0]

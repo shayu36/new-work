@@ -22,3 +22,5 @@ tf_logs
 *.so
 =2.0.0
 stp3_val
+AD-MLP/
+OccWorldCode/

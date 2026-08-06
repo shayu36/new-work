@@ -243,7 +243,7 @@ test_data_config = dict(
     ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
 
 data = dict(
-    samples_per_gpu=2,  # with 32 GPU, Batch Size=32
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         data_root=data_root,
@@ -274,7 +274,7 @@ lr_config = dict(
 
 checkpoint_config = dict(
     interval=1,  
-    max_keep_ckpts=5,   
+    max_keep_ckpts=-1,
     save_last=True     
 )
 

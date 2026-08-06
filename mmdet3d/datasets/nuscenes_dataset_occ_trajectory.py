@@ -141,9 +141,18 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
                 is_train=True,
                 aux_frames=[-1,1],
                 max_ray_nums=0,
+                query_memory_cache_root=None,
+                query_memory_history_frames=3,
+                query_memory_max_queries_per_frame=256,
+                query_memory_strict=False,
                 wrs_use_batch=False,
                 **kwargs):
         super().__init__(**kwargs)
+        self.query_memory_cache_root = query_memory_cache_root
+        self.query_memory_history_frames = int(query_memory_history_frames)
+        self.query_memory_max_queries_per_frame = int(
+            query_memory_max_queries_per_frame)
+        self.query_memory_strict = bool(query_memory_strict)
         self.use_rays = use_rays
         self.if_dense = if_dense
         self.semantic_gt_path = semantic_gt_path
@@ -208,6 +217,40 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         """
         return len(self.temp2nusc_map)
         # return 1
+
+    def _query_memory_scene_id(self, info):
+        return info.get('scene_token', info.get('scene_name', None))
+
+    def _query_memory_timestamp(self, info):
+        return float(info['timestamp']) / 1e6
+
+    def _query_memory_frame_idx(self, info, fallback_index):
+        return int(info.get('frame_idx', fallback_index))
+
+    def _build_query_memory_history_infos(self, index):
+        if self.query_memory_history_frames <= 0:
+            return []
+        current = self.data_infos[index]
+        current_scene = self._query_memory_scene_id(current)
+        current_ts = self._query_memory_timestamp(current)
+        history_infos = []
+        hist_index = index - 1
+        while hist_index >= 0 and len(history_infos) < self.query_memory_history_frames:
+            hist = self.data_infos[hist_index]
+            if self._query_memory_scene_id(hist) != current_scene:
+                break
+            hist_ts = self._query_memory_timestamp(hist)
+            if hist_ts < current_ts:
+                history_infos.append(dict(
+                    sample_idx=str(hist['token']),
+                    scene_id=str(self._query_memory_scene_id(hist)),
+                    scene_token=hist.get('scene_token', None),
+                    scene_name=hist.get('scene_name', None),
+                    frame_idx=self._query_memory_frame_idx(hist, hist_index),
+                    timestamp=hist_ts))
+            hist_index -= 1
+        history_infos.reverse()
+        return history_infos
     
     def load_annotations(self, ann_file):
         """Load annotations from ann_file.
@@ -391,6 +434,16 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         intervals = [1, 2, 3, 4, 5, 6]
 
         input_dict = super(NuScenesDatasetOccpancy4DTraj, self).get_data_info(index)
+        current_info = self.data_infos[index]
+        input_dict['scene_token'] = current_info.get('scene_token', None)
+        input_dict['scene_id'] = self._query_memory_scene_id(current_info)
+        input_dict['frame_idx'] = self._query_memory_frame_idx(
+            current_info, index)
+        input_dict['timestamp'] = self._query_memory_timestamp(current_info)
+        input_dict['query_memory_history_infos'] =             self._build_query_memory_history_infos(index)
+        input_dict['query_memory_cache_root'] = self.query_memory_cache_root
+        input_dict['query_memory_max_queries_per_frame'] =             self.query_memory_max_queries_per_frame
+        input_dict['query_memory_strict'] = self.query_memory_strict
         input_dict['with_gt'] = self.data_infos[index]['with_gt'] if 'with_gt' in self.data_infos[index] else True
         if 'occ_path' in self.data_infos[index]:
             input_dict['occ_gt_path'] = self.data_infos[index]['occ_path']

@@ -10,6 +10,7 @@ from .loading import (LoadAnnotations3D, LoadAnnotationsBEVDepth,
                       PrepareImageInputs, LoadOccGTFromFile, 
                       )
 from .loading_traj_temporal import (LoadOccGTFromFile4DTraj, LoadAnnotationsBEVDepth4DTraj, PrepareImageInputs4DTraj)
+from .loading_query_memory import LoadQueryMemoryFromFiles
 from .test_time_aug import MultiScaleFlipAug3D
 # yapf: disable
 from .transforms_3d import (AffineResize, BackgroundPointsFilter,
@@ -38,5 +39,6 @@ __all__ = [
     'LoadAnnotationsBEVDepth', 'PointToMultiViewDepth',
     'LoadOccGTFromFile', 'Point2Occ', 'LoadSiftPairs',
     'Collect4D',
-    'LoadOccGTFromFile4DTraj', 'LoadAnnotationsBEVDepth4DTraj', 'PrepareImageInputs4DTraj'
+    'LoadOccGTFromFile4DTraj', 'LoadAnnotationsBEVDepth4DTraj', 'PrepareImageInputs4DTraj',
+    'LoadQueryMemoryFromFiles'
 ]
