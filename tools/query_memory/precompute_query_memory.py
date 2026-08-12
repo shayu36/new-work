@@ -30,6 +30,9 @@ def parse_args():
     parser.add_argument('--write-threshold', type=float, default=0.35)
     parser.add_argument('--workers-per-gpu', type=int, default=2)
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--skip-existing', action='store_true',
+                        help='skip samples whose cache file already exists '
+                             '(resume)')
     return parser.parse_args()
 
 
@@ -170,7 +173,7 @@ def unwrap_data_value(value):
 def run_sparseworld_rap_prefix(model, img, img_metas, data):
     """Run the same RAP prefix used by SparseWorld forward_backbone."""
     temporal_ego_states = unwrap_data_value(data['temporal_ego_states'])
-    ego_states = temporal_ego_states[0]
+    ego_states = temporal_ego_states[0].cuda(non_blocking=True)
     bs, _, dim_ = ego_states.shape
     ego_states = ego_states.view((bs, 1, dim_))
     ego_feat = model.plan_head(ego_states)
@@ -187,6 +190,40 @@ def main():
     cfg = Config.fromfile(args.config)
     if 'query_memory_cfg' in cfg.model:
         cfg.model.query_memory_cfg = dict(enabled=False)
+    # Strip LoadQueryMemoryFromFiles from pipeline (we are generating cache, not loading it)
+    # Also remove memory-related keys from Collect4D (including nested inside
+    # MultiScaleFlipAug3D transforms, which is how the val/test pipeline is built)
+    MEMORY_KEYS = {'memory_query_feat', 'memory_points_metric', 'memory_conf',
+                   'memory_valid', 'memory_source_ego2global', 'memory_age'}
+
+    def _sanitize_transform(p):
+        p = dict(p)  # shallow copy
+        if p.get('type') == 'Collect4D':
+            p['keys'] = [k for k in p.get('keys', []) if k not in MEMORY_KEYS]
+            meta_keys = p.get('meta_keys', [])
+            if isinstance(meta_keys, (list, tuple)):
+                meta_keys = [k for k in meta_keys if k not in MEMORY_KEYS]
+                p['meta_keys'] = type(meta_keys)(meta_keys)  # preserve tuple type
+        if p.get('type') == 'MultiScaleFlipAug3D' and 'transforms' in p:
+            p['transforms'] = [_sanitize_transform(t) for t in p['transforms']]
+        return p
+
+    for pipe_key in ('pipeline', 'test_pipeline'):
+        if pipe_key not in cfg.data[args.split]:
+            continue
+        new_pipe = []
+        for p in cfg.data[args.split][pipe_key]:
+            if p.get('type') == 'LoadQueryMemoryFromFiles':
+                continue
+            # Flatten MultiScaleFlipAug3D into its inner transforms: the
+            # precompute forward expects a plain dict result, not a
+            # dict-of-lists produced by the test-time augmentation wrapper.
+            if p.get('type') == 'MultiScaleFlipAug3D':
+                for inner in p.get('transforms', []):
+                    new_pipe.append(_sanitize_transform(inner))
+                continue
+            new_pipe.append(_sanitize_transform(p))
+        cfg.data[args.split][pipe_key] = new_pipe
     dataset = build_dataset(cfg.data[args.split])
     data_loader = build_dataloader(
         dataset,
@@ -199,12 +236,27 @@ def main():
     model.eval().cuda()
 
     output_dir = Path(args.output_dir)
+    skipped = 0
     with torch.no_grad():
         for data in data_loader:
             img_metas = unwrap_img_metas(data)
             if len(img_metas) != 1:
                 raise RuntimeError('precompute_query_memory requires batch_size=1')
-            img = data['img'].cuda(non_blocking=True)
+            if args.skip_existing:
+                meta = img_metas[0]
+                pre_path = output_path(
+                    output_dir,
+                    scene_id_from_meta(meta),
+                    str(meta_value(meta, 'sample_idx')))
+                if pre_path.exists():
+                    skipped += 1
+                    if skipped % 1000 == 0:
+                        print(f'[skip-existing] skipped {skipped} so far', flush=True)
+                    continue
+            img = data['img']
+            if hasattr(img, 'data'):
+                img = img.data[0]
+            img = img.cuda(non_blocking=True)
             outs = run_sparseworld_rap_prefix(model, img, img_metas, data)
             cache = build_cache_record(model, outs, img_metas[0], args)
             path = output_path(output_dir, cache['scene_id'], cache['sample_idx'])
@@ -213,6 +265,8 @@ def main():
                     f'{path} already exists; pass --overwrite to replace it')
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(cache, path)
+    if skipped:
+        print(f'[skip-existing] total skipped: {skipped}', flush=True)
 
 
 if __name__ == '__main__':

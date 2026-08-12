@@ -20,6 +20,7 @@ result
 tf_logs
 .idea/
 *.so
+*.stacqm
 =2.0.0
 stp3_val
 AD-MLP/
