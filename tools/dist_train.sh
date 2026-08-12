@@ -15,4 +15,5 @@ PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
     $(dirname "$0")/train.py \
     $CONFIG \
     --work-dir ./work_dirs/our-nusc-base \
-    --launcher pytorch ${@:3}
+    --launcher pytorch \
+    --validate ${@:3}

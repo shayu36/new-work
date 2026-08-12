@@ -22,5 +22,9 @@ lr_config = dict(
     min_lr_ratio=1e-3
 )
 
-runner = dict(type='EpochBasedRunner', max_epochs=24)
+runner = dict(type='EpochBasedRunner', max_epochs=42)
+data = dict(samples_per_gpu=4, workers_per_gpu=2)
 load_from = 'ckpts/epoch_56.pth'
+
+# 每 2 个 epoch 自动评估一次（覆盖 base config 的 interval=24）
+evaluation = dict(interval=2)

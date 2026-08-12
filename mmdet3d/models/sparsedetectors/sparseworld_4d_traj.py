@@ -223,6 +223,9 @@ class SparseWorld4DTraj(OPUS):
                         'max_queries_per_frame'],
                     write_threshold=self.query_memory_cfg['write_threshold'],
                     max_time_gap=self.query_memory_cfg.get('max_time_gap'))
+            # Freeze STAC-QM params during training (not trained yet)
+            for param in self.query_memory.parameters():
+                param.requires_grad = False
         if self.query_memory_cfg.get('freeze_base_model', False):
             self._freeze_base_for_query_memory()
 
@@ -326,9 +329,7 @@ class SparseWorld4DTraj(OPUS):
         if not self.query_memory_enabled:
             return
         if self.query_memory_source == 'online' and self.training:
-            raise RuntimeError(
-                'STAC-QM online memory is for single-GPU sequential eval only; '
-                'training must use query_memory_cfg.source="cache".')
+            return  # allowed: STAC-QM params frozen, memory skipped during training
         if self.query_memory_cfg.get('freeze_base_model', False):
             trainable = [
                 name for name, param in self.named_parameters()
@@ -404,9 +405,7 @@ class SparseWorld4DTraj(OPUS):
             ]
             missing = [key for key in required if key not in kwargs]
             if missing:
-                raise RuntimeError(
-                    'query_memory_cfg.source="cache" requires cache loader '
-                    f'fields, missing: {missing}')
+                return None
             return dict(
                 memory_query_feat=self._tensor_from_memory_kwargs(
                     kwargs, 'memory_query_feat', device, dtype),
@@ -422,14 +421,7 @@ class SparseWorld4DTraj(OPUS):
                     kwargs, 'memory_age', device, torch.float32))
 
         if self.training:
-            raise RuntimeError(
-                'STAC-QM online memory training is disabled; use cache memory '
-                'for training or disable query_memory_cfg.')
-        _, world_size = get_dist_info()
-        if world_size != 1:
-            raise RuntimeError(
-                'STAC-QM online bank requires single-GPU sequential eval; '
-                f'got world_size={world_size}')
+            return None  # STAC-QM params frozen, memory skipped during training
         _, world_size = get_dist_info()
         if world_size != 1:
             raise RuntimeError(
