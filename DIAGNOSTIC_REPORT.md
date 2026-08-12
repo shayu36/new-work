@@ -38,20 +38,60 @@ Powered by Sparse and Dynamic Queries" (arXiv:2510.17482)
 
 训练配置: `sparseworld-traj-memory.py` (memory 未启用，实际是无 memory 基线)
 checkpoint: `work_dirs/stacqm/epoch_51.pth`
+评估脚本: `tools/test_temporal.py`, 4,219 个 val 样本
 
 | 指标 | 0s | 1s | 2s | 3s |
 |------|----|----|----|-----|
 | mIoU | 14.72 | 12.32 | 11.10 | 9.84 |
 | IoU | 24.28 | 21.93 | 21.27 | 20.35 |
 
-17 类逐类别 IoU (epoch 51, 0s):
-others 2.64, barrier 12.99, bicycle 1.59, bus 11.46, car 13.79,
-construction_vehicle 5.36, motorcycle 1.26, pedestrian 1.87, traffic_cone 2.9,
-trailer 6.02, truck 9.91, driveable_surface 27.24, other_flat 16.31,
-sidewalk 15.4, terrain 14.54, manmade 9.53, vegetation 14.43
+17 类逐类别 IoU (epoch 51):
+
+| 类别 | 0s | 1s | 2s | 3s |
+|------|----|----|----|-----|
+| others | 2.87 | 2.79 | 2.67 | 2.64 |
+| barrier | 17.46 | 16.14 | 14.90 | 12.99 |
+| bicycle | 4.56 | 2.90 | 2.35 | 1.59 |
+| bus | 22.11 | 18.40 | 14.44 | 11.46 |
+| car | 23.98 | 19.41 | 16.06 | 13.79 |
+| construction_vehicle | 7.71 | 7.21 | 6.58 | 5.36 |
+| motorcycle | 4.93 | 2.62 | 1.82 | 1.26 |
+| pedestrian | 7.75 | 4.83 | 2.98 | 1.87 |
+| traffic_cone | 6.01 | 4.91 | 3.95 | 2.90 |
+| trailer | 8.41 | 7.58 | 6.69 | 6.02 |
+| truck | 16.19 | 13.90 | 11.79 | 9.91 |
+| driveable_surface | 36.78 | 30.01 | 29.03 | 27.24 |
+| other_flat | 23.23 | 18.38 | 17.74 | 16.31 |
+| sidewalk | 21.70 | 17.53 | 16.73 | 15.40 |
+| terrain | 19.78 | 16.74 | 15.81 | 14.54 |
+| manmade | 10.70 | 10.35 | 10.03 | 9.53 |
+| vegetation | 16.12 | 15.73 | 15.17 | 14.43 |
+| free | 91.82 | 91.19 | 91.17 | 91.16 |
 
 完整逐 epoch 记录: `work_dirs/stacqm/eval_results/summary.csv` 和
 `work_dirs/stacqm/eval_results_w4_34_52/summary_34_52.csv`
+
+## 训练信息 (日志 20260810_074239.log)
+
+- **训练命令**: `tools/dist_train.sh` → torchrun 2 GPU (RTX 3090), master_port 29500,
+  launcher=pytorch, config=`sparseworld-traj-memory.py`, work_dir=`work_dirs/stacqm`
+- **checkpoint**: 从 `epoch_33.pth` 续训 (resumed epoch 33, iter 81411)
+- **missing/unexpected keys**: 续训无此输出 (完整 checkpoint 恢复)
+- **参数统计** (epoch_51.pth):
+  - 总参数: 76,946,522
+  - query_memory.* 参数: 856,612 (25 个 tensor, 训练时 frozen, requires_grad=False)
+  - 基座参数: 76,089,910
+- **学习率**: 5e-5, CosineAnnealing + linear warmup (warmup_iters=200), min_lr_ratio=1e-3
+- **batch size**: 4/GPU × 2 GPU = 8
+- **每 epoch**: 2,467 iter, 已训练至 epoch 52
+- **总 loss 趋势** (各 epoch 首 iter 50/2467):
+  13.35 (ep34) → 13.20 (ep35) → 13.01 (ep36) → 13.13 (ep37) → 12.99 (ep38)
+  → 12.92 (ep42) → 12.70 (ep47) → 12.91 (ep48) → 12.85 (ep49) → 12.97 (ep50)
+  → 12.84 (ep51) → 12.92 (ep52)
+- **loss 组成** (ep52 iter250): init_loss_pts 2.83, d0-d5 loss_cls 0.28→0.15,
+  d0-d5 loss_pts 1.89→0.44, fu1-fu6 loss_cls 0.15→0.18, fu1-fu6 loss_pts 0.43→0.46,
+  loss_traj_1s-6s 0.038/0.020/0.022/0.028/0.033/0.050, grad_norm 11.2
+- 日志摘录: `logs/train_log_head.txt` (本仓库已提交)
 
 ## 缓存覆盖率统计
 
