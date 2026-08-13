@@ -101,11 +101,27 @@ checkpoint: `work_dirs/stacqm/epoch_51.pth`
 | 每帧 Query 数 | 256 (满) | 256 (满) |
 | Confidence min/median/max | 0.608 / 0.938 / 0.994 | 0.564 / 0.915 / 0.995 |
 | Conf ≥ 0.35 比例 | 100% | 100% |
+| 本帧缓存命中率 | 100% | 100% |
+| 有效历史帧数 mean | 2.48 | 2.48 |
+| 0 历史帧比例 | 14.9% | 15.0% |
+| 3 历史帧比例 | 80.1% | 80.1% |
+
+历史帧统计口径: 模拟 `loading_query_memory.py` 的查找逻辑 (同 scene、
+timestamp 严格小于当前帧、最多向前 10 帧内找 3 帧)。
 
 - 缓存由 `precompute_query_memory.py` 用 epoch_51 checkpoint 生成
 - train 缓存目录: `data/query_memory/sparseworld_train` (未上传, 19,730 个 .pt, 共 ~8GB)
 - val 缓存目录: `data/query_memory/sparseworld_val` (未上传, 4,219 个 .pt)
 - 抽样样本: 本仓库 `cache_samples/train/` 和 `cache_samples/val/` 各 20 个 .pt
+
+### confidence / age / distance 分布
+
+- **confidence**: train min=0.608 median=0.938 max=0.994; val min=0.564 median=0.915 max=0.995
+  (缓存写入阈值 0.35, top-256 截断, 分布集中在高置信区间)
+- **age** (eval 实测, 23.3M query): mean=0.879s std=0.263 max=1.70s
+  (max_age=3.0s 未截断, 全部为 0.5s 间隔的相邻帧)
+- **distance** (eval 实测): mean=7.74m std=2.24 max=12.0m
+  (spatial_radius=12.0m 边界处有截断)
 
 ## 缓存样本格式 (schema_version=1)
 
