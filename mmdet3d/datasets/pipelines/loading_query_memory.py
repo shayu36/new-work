@@ -13,6 +13,22 @@ except Exception:
             return _decorator
     PIPELINES = _FallbackRegistry()
 
+# Share the EXACT deterministic diversity-selection and reliability functions
+# with the model / online bank. Fall back to a standalone import so the loader
+# can be exercised in a torch-only environment without mmdet3d installed.
+try:
+    from mmdet3d.models.sparsedetectors.query_memory import (
+        select_diverse_memory_queries, compute_query_reliability)
+except Exception:
+    import importlib.util as _ilu
+    _qm_path = (Path(__file__).resolve().parents[2] /
+                'models' / 'sparsedetectors' / 'query_memory.py')
+    _spec = _ilu.spec_from_file_location('_qm_for_loader', _qm_path)
+    _qm = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_qm)
+    select_diverse_memory_queries = _qm.select_diverse_memory_queries
+    compute_query_reliability = _qm.compute_query_reliability
+
 
 def _first_scalar(value, default=None):
     if value is None:
@@ -65,7 +81,13 @@ class LoadQueryMemoryFromFiles(object):
                  strict=False,
                  embed_dims=256,
                  num_points=48,
-                 file_suffix='.pt'):
+                 file_suffix='.pt',
+                 history_selection_mode='recent',
+                 history_target_ages=(2.5, 3.5, 4.5),
+                 min_reliability=0.0,
+                 spatial_cell_size=4.0,
+                 max_per_spatial_cell=16,
+                 max_per_class=64):
         self.cache_root = cache_root
         self.history_frames = int(history_frames)
         self.max_queries_per_frame = int(max_queries_per_frame)
@@ -73,6 +95,19 @@ class LoadQueryMemoryFromFiles(object):
         self.embed_dims = int(embed_dims)
         self.num_points = int(num_points)
         self.file_suffix = file_suffix
+        # Problem 6 (history selection) + Problem 5 (diversity selection).
+        self.history_selection_mode = str(history_selection_mode)
+        self.history_target_ages = [float(a) for a in history_target_ages]
+        self.min_reliability = float(min_reliability)
+        self.spatial_cell_size = float(spatial_cell_size)
+        self.max_per_spatial_cell = int(max_per_spatial_cell)
+        self.max_per_class = int(max_per_class)
+
+    @property
+    def num_slots(self):
+        if self.history_selection_mode == 'target_age':
+            return len(self.history_target_ages)
+        return self.history_frames
 
     def _candidate_paths(self, root, hist):
         sample = str(hist.get('sample_idx', hist.get('sample_token')))
@@ -110,7 +145,7 @@ class LoadQueryMemoryFromFiles(object):
         missing = [key for key in required if key not in cache]
         if missing:
             raise KeyError(f'{path} missing query memory keys: {missing}')
-        if int(cache['schema_version']) != 1:
+        if int(cache['schema_version']) not in (1, 2):
             raise ValueError(
                 f'{path} has unsupported schema_version '
                 f'{cache["schema_version"]}')
@@ -133,6 +168,11 @@ class LoadQueryMemoryFromFiles(object):
             raise ValueError(f'{path} query_feat/valid_mask M mismatch')
         if tuple(ego2global.shape) != (4, 4):
             raise ValueError(f'{path} ego2global must be [4, 4]')
+        M = query_feat.shape[0]
+        if int(cache['schema_version']) >= 2:
+            for key in ('query_reliability', 'query_label'):
+                if key in cache and cache[key].shape[0] != M:
+                    raise ValueError(f'{path} {key} must share M with query_feat')
         if hist is None:
             return
         hist_scene = self._hist_scene_id(hist)
@@ -160,17 +200,47 @@ class LoadQueryMemoryFromFiles(object):
         if current_ts is not None and float(cache['timestamp']) >= float(current_ts):
             raise ValueError(f'{path} is not causal for current timestamp')
 
-    def _select_top_queries(self, cache):
+    def _cache_reliability_labels(self, cache):
+        """Return (reliability [M], label [M]) honoring schema version.
+
+        Schema v2 stores these directly. Schema v1 has neither; reliability
+        degrades to query_conf and label to -1 (unknown), which disables the
+        class-diversity constraint downstream.
+        """
+        conf = cache['query_conf'].detach().cpu().float()
+        M = conf.shape[0]
+        if int(cache.get('schema_version', 1)) >= 2 and \
+                'query_reliability' in cache:
+            reliability = cache['query_reliability'].detach().cpu().float()
+        else:
+            reliability = conf.clone()
+        if int(cache.get('schema_version', 1)) >= 2 and 'query_label' in cache:
+            label = cache['query_label'].detach().cpu().long()
+        else:
+            label = torch.full((M,), -1, dtype=torch.long)
+        return reliability, label
+
+    def _select_queries(self, cache):
         feat = cache['query_feat'].detach().cpu()
-        points = cache['query_points_metric'].detach().cpu()
+        points = cache['query_points_metric'].detach().cpu().float()
         conf = cache['query_conf'].detach().cpu().float()
         valid = cache['valid_mask'].detach().cpu().bool()
-        valid = valid & torch.isfinite(conf) & (conf > 0)
-        indices = torch.nonzero(valid, as_tuple=False).flatten()
-        if indices.numel() > self.max_queries_per_frame:
-            _, order = torch.topk(conf[indices], self.max_queries_per_frame)
-            indices = indices[order]
-        return feat[indices], points[indices], conf[indices], valid[indices]
+        reliability, label = self._cache_reliability_labels(cache)
+        # deterministic reliability + class + spatial diversity, identical to
+        # the online bank's selection rule.
+        indices = select_diverse_memory_queries(
+            points,
+            reliability,
+            valid=valid,
+            labels=label,
+            max_queries=self.max_queries_per_frame,
+            min_reliability=self.min_reliability,
+            spatial_cell_size=self.spatial_cell_size,
+            max_per_spatial_cell=self.max_per_spatial_cell,
+            max_per_class=self.max_per_class)
+        sel_valid = torch.ones(indices.numel(), dtype=torch.bool)
+        return (feat[indices], points[indices], conf[indices],
+                reliability[indices], label[indices], sel_valid)
 
     def _history_candidates(self, results):
         current_scene = _scene_id(results)
@@ -196,17 +266,24 @@ class LoadQueryMemoryFromFiles(object):
                 if float(hist_ts) >= current_ts:
                     continue
             filtered.append(hist)
+        if self.history_selection_mode == 'target_age':
+            # dataset already assigned one info per target-age slot; keep all
+            # causal candidates that carry a slot_index.
+            slotted = [h for h in filtered if h.get('slot_index') is not None]
+            return slotted if slotted else filtered[-self.num_slots:]
         return filtered[-self.history_frames:]
 
     def _empty_outputs(self, embed_dims=None, num_points=None):
         embed_dims = self.embed_dims if embed_dims is None else int(embed_dims)
         num_points = self.num_points if num_points is None else int(num_points)
-        K = self.history_frames
+        K = self.num_slots
         M = self.max_queries_per_frame
         return dict(
             memory_query_feat=torch.zeros(K, M, embed_dims),
             memory_points_metric=torch.zeros(K, M, num_points, 3),
             memory_conf=torch.zeros(K, M),
+            memory_reliability=torch.zeros(K, M),
+            memory_label=torch.full((K, M), -1, dtype=torch.long),
             memory_valid=torch.zeros(K, M, dtype=torch.bool),
             memory_source_ego2global=torch.eye(4).repeat(K, 1, 1),
             memory_age=torch.zeros(K, M))
@@ -243,16 +320,35 @@ class LoadQueryMemoryFromFiles(object):
             embed_dims = int(first_cache['query_feat'].shape[-1])
             num_points = int(first_cache['query_points_metric'].shape[-2])
         memory = self._empty_outputs(embed_dims, num_points)
-        offset = self.history_frames - len(loaded)
-        for out_index, (_, _, cache) in enumerate(loaded, start=offset):
+
+        num_slots = self.num_slots
+        if self.history_selection_mode == 'target_age':
+            # place each cache into its dataset-assigned target-age slot.
+            placements = []
+            for hist, _, cache in loaded:
+                slot = hist.get('slot_index')
+                if slot is None or not (0 <= int(slot) < num_slots):
+                    continue
+                placements.append((int(slot), cache))
+        else:
+            # right-align recent frames (legacy behavior).
+            offset = num_slots - len(loaded)
+            placements = [
+                (offset + k, cache) for k, (_, _, cache) in enumerate(loaded)]
+
+        for out_index, cache in placements:
             if cache is None:
                 continue
-            feat, points, conf, valid = self._select_top_queries(cache)
+            feat, points, conf, reliability, label, valid = \
+                self._select_queries(cache)
             n = min(feat.shape[0], self.max_queries_per_frame)
+            # base_age = t_current - t_history (NEVER mutate cached timestamps).
             age = float(current_ts) - float(cache['timestamp'])
             memory['memory_query_feat'][out_index, :n] = feat[:n]
             memory['memory_points_metric'][out_index, :n] = points[:n]
             memory['memory_conf'][out_index, :n] = conf[:n]
+            memory['memory_reliability'][out_index, :n] = reliability[:n]
+            memory['memory_label'][out_index, :n] = label[:n]
             memory['memory_valid'][out_index, :n] = valid[:n] & (age > 0)
             memory['memory_source_ego2global'][out_index] = \
                 cache['ego2global'].detach().cpu().float()

@@ -4,7 +4,16 @@ This repository now implements STAC-QM: Spatio-Temporally Aligned and Confidence
 
 ## Scope
 
-The first version uses only observation memory from real past frames. It does not add predicted query memory, instance tracking, fixed query-index matching, future ego poses, motion residual networks, or an independent confidence head.
+The first version uses only observation memory from real past frames. It does not add predicted query memory, instance tracking, fixed query-index matching, or an independent confidence head.
+
+> **Modeling-structure repair (2026-08).** Six modeling-structure repairs have
+> since been applied (single-read control flow, future-aware age, a
+> zero-initialized motion residual, per-query semantic reliability, deterministic
+> diversity selection, and target-age history selection). See
+> [STAC_QM_Modeling_Repair.md](STAC_QM_Modeling_Repair.md) for the authoritative
+> description. This section documents the original v1 behavior; where the two
+> differ, the repair doc governs. No training or evaluation has been run as part
+> of the repair — only the modeling structure and synthetic CPU tests changed.
 
 ## Memory Record
 
@@ -49,9 +58,9 @@ The online bank is strict batch-size one. It clears on scene change, frame rollb
 
 STAC-QM is inserted without rewriting the original SCF loop:
 
-- At the start of each interval, all active queries are fused once before `ego_cross_attn` and scene updates.
-- After scheduled queries for that interval are appended, only the new scheduled slice is fused once before it first enters the scene update branches.
-- Existing active queries are not fused twice in the same interval.
+- The observation queries are fused **once**, before the SCF interval loop begins.
+- After the scheduled queries for an interval are appended, only that new scheduled slice is fused **once**, with a future-aware age offset of `(interval + 1) * frame_interval`.
+- Already-fused active queries are never re-read on later intervals — each query reads real history memory at most once (repair Problem 1).
 - The original interval count, query schedule, causal mask, position encoding, `ego_cross_attn`, branches, moving mask, `refine_points`, detach behavior, losses, and output dictionaries are preserved.
 
 ## Attention And Fusion
@@ -84,7 +93,7 @@ There is no unconditional LayerNorm on the final output, so empty memory and no-
 
 ## Cache Precompute
 
-`tools/query_memory/precompute_query_memory.py` runs a baseline config/checkpoint in eval/no_grad mode and saves schema version 1 cache files. It refuses to overwrite existing files unless `--overwrite` is passed.
+`tools/query_memory/precompute_query_memory.py` runs a baseline config/checkpoint in eval/no_grad mode and saves cache files. As of the modeling repair it writes **schema version 2**, adding per-query `query_reliability` and `query_label`, and uses the shared deterministic diversity selection. Schema-v1 caches remain loadable (reliability degrades to `query_conf`, label to `-1`). It refuses to overwrite existing files unless `--overwrite` is passed.
 
 Example:
 
@@ -106,4 +115,4 @@ When `query_memory_cfg is None` or `enabled=False`, SparseWorld4DTraj does not r
 
 ## Synthetic Validation
 
-`tests/test_query_memory.py` uses only temporary synthetic tensors and temporary cache files. It covers ego-pose alignment, confidence computation, multi-head shapes, age/radius/top-k filtering, safe all-invalid behavior, exact identity fallback, scene isolation, online read-before-write behavior, loader padding, strict missing-cache behavior, and configuration errors.
+`tests/test_query_memory.py` and `tests/test_query_memory_integration.py` use only temporary synthetic tensors and temporary cache files (CPU only, no dataset/checkpoint/GPU). Together they cover ego-pose alignment, confidence computation, multi-head shapes, age/radius/top-k filtering, safe all-invalid behavior, exact identity fallback, scene isolation, online read-before-write behavior, loader padding, strict missing-cache behavior, configuration errors, per-query reliability, future-aware effective age, deterministic diversity selection (spatial/class caps + v1 degradation), the zero-initialized motion compensator, reliability-weighted attention, target-age history slot assignment (bank + loader), schema-v1/v2 loader behavior, and the future-offset causal filter. See [STAC_QM_Modeling_Repair.md](STAC_QM_Modeling_Repair.md#test-results) for the full case list and the tests that could not be run in this phase.

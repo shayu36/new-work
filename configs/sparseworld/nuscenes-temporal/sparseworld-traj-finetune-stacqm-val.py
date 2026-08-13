@@ -67,6 +67,18 @@ query_memory_max_queries_per_frame = 256
 query_memory_write_threshold = 0.35
 query_memory_embed_dims = embed_dims
 query_memory_num_heads = 8
+# STAC-QM modeling-repair configuration (Problems 2/3/5/6).
+query_memory_frame_interval = 0.5
+query_memory_history_selection_mode = 'target_age'
+query_memory_history_target_ages = [2.5, 3.5, 4.5]
+query_memory_history_age_tolerance = 0.35
+query_memory_visual_history_window = 2.0
+query_memory_retention_seconds = 5.0
+query_memory_max_bank_entries = 16
+query_memory_min_reliability = 0.0
+query_memory_spatial_cell_size = 4.0
+query_memory_max_per_spatial_cell = 16
+query_memory_max_per_class = 64
 num_layers = 6
 num_query = 720
 num_fu_query = [60,60,60,60,40,40]
@@ -119,18 +131,37 @@ model = dict(
     query_memory_cfg=dict(
         enabled=True,
         source='cache',
+        # --- future-aware age (Problem 2) ---
+        frame_interval=query_memory_frame_interval,
+        # --- history selection (Problem 6) ---
+        history_selection_mode=query_memory_history_selection_mode,
         history_frames=query_memory_history_frames,
+        history_target_ages=query_memory_history_target_ages,
+        history_age_tolerance=query_memory_history_age_tolerance,
+        visual_history_window=query_memory_visual_history_window,
+        retention_seconds=query_memory_retention_seconds,
+        max_bank_entries=query_memory_max_bank_entries,
+        # --- diversity selection (Problem 5) ---
         max_queries_per_frame=query_memory_max_queries_per_frame,
         write_threshold=query_memory_write_threshold,
+        min_reliability=query_memory_min_reliability,
+        spatial_cell_size=query_memory_spatial_cell_size,
+        max_per_spatial_cell=query_memory_max_per_spatial_cell,
+        max_per_class=query_memory_max_per_class,
+        # --- attention / fusion ---
         embed_dims=query_memory_embed_dims,
         num_heads=query_memory_num_heads,
-        spatial_radius=12.0,
-        topk=32,
-        max_age=3.0,
+        spatial_radius=6.0,
+        topk=16,
+        max_age=8.0,
         lambda_position=1.0,
         lambda_time=1.0,
-        lambda_confidence=1.0,
+        lambda_reliability=1.0,
         dropout=0.0,
+        # --- motion compensation (Problem 3) ---
+        motion_compensation=True,
+        max_velocity=20.0,
+        # --- misc ---
         log_diagnostics=True,
         freeze_base_model=True),
     data_aug=dict(
@@ -220,14 +251,20 @@ train_pipeline = [
         max_queries_per_frame=query_memory_max_queries_per_frame,
         strict=False,
         embed_dims=query_memory_embed_dims,
-        num_points=query_memory_num_points),
+        num_points=query_memory_num_points,
+        history_selection_mode=query_memory_history_selection_mode,
+        history_target_ages=query_memory_history_target_ages,
+        min_reliability=query_memory_min_reliability,
+        spatial_cell_size=query_memory_spatial_cell_size,
+        max_per_spatial_cell=query_memory_max_per_spatial_cell,
+        max_per_class=query_memory_max_per_class),
     dict(type='RandomTransformImage',ida_aug_conf=ida_aug_conf,training=True),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
         type='Collect4D', keys=['img', 'voxel_semantics',
                                 'mask_lidar','mask_camera',
                                  'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_ego2global',
-                                 'memory_query_feat', 'memory_points_metric', 'memory_conf', 'memory_valid', 'memory_source_ego2global', 'memory_age',
+                                 'memory_query_feat', 'memory_points_metric', 'memory_conf', 'memory_reliability', 'memory_label', 'memory_valid', 'memory_source_ego2global', 'memory_age',
                                ],meta_keys = ('filename','ori_shape','img_shape','pad_shape','lidar2img','img_timestamp','timestamp','ego2lidar','ego2global','sample_idx','scene_token','scene_name','frame_idx',))
 ]
 
@@ -242,7 +279,13 @@ test_pipeline = [
         max_queries_per_frame=query_memory_max_queries_per_frame,
         strict=False,
         embed_dims=query_memory_embed_dims,
-        num_points=query_memory_num_points),
+        num_points=query_memory_num_points,
+        history_selection_mode=query_memory_history_selection_mode,
+        history_target_ages=query_memory_history_target_ages,
+        min_reliability=query_memory_min_reliability,
+        spatial_cell_size=query_memory_spatial_cell_size,
+        max_per_spatial_cell=query_memory_max_per_spatial_cell,
+        max_per_class=query_memory_max_per_class),
     dict(type='RandomTransformImage',ida_aug_conf=ida_aug_conf,training=False),
     dict(
         type='MultiScaleFlipAug3D',
@@ -257,7 +300,7 @@ test_pipeline = [
             dict(type='Collect4D', keys=['img', 'voxel_semantics',
                                         'mask_lidar','mask_camera','temporal_semantics',
                                         'temporal_ego_states', 'temporal_trajs', 'temporal_agent_boxes', 'temporal_agent_feats',
-                                        'memory_query_feat', 'memory_points_metric', 'memory_conf', 'memory_valid', 'memory_source_ego2global', 'memory_age',],
+                                        'memory_query_feat', 'memory_points_metric', 'memory_conf', 'memory_reliability', 'memory_label', 'memory_valid', 'memory_source_ego2global', 'memory_age',],
                  meta_keys = ['filename','box_type_3d','ori_shape','img_shape','pad_shape','sample_idx',
                               'lidar2img','img_timestamp','timestamp','ego2lidar','ego2global','scene_token','scene_name','frame_idx','gt_boxes','gt_labels','occ_gt_path'])
         ])
@@ -282,6 +325,10 @@ share_data_config = dict(
     query_memory_history_frames=query_memory_history_frames,
     query_memory_max_queries_per_frame=query_memory_max_queries_per_frame,
     query_memory_strict=False,
+    query_memory_history_selection_mode=query_memory_history_selection_mode,
+    query_memory_history_target_ages=query_memory_history_target_ages,
+    query_memory_history_age_tolerance=query_memory_history_age_tolerance,
+    query_memory_visual_history_window=query_memory_visual_history_window,
 )
 
 test_data_config = dict(

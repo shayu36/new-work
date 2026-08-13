@@ -4,6 +4,7 @@ from .opus import OPUS
 import torch.nn.functional as F
 import torch
 import time
+import warnings
 from mmdet.models import DETECTORS
 from mmdet.models.builder import build_loss
 from mmcv.cnn.bricks.conv_module import ConvModule
@@ -194,6 +195,8 @@ class SparseWorld4DTraj(OPUS):
         self.query_memory_enabled = bool(self.query_memory_cfg.get('enabled', False))
         self.memory_enabled = self.query_memory_enabled
         self.query_memory_source = self.query_memory_cfg.get('source', 'cache')
+        self.query_memory_frame_interval = float(
+            self.query_memory_cfg.get('frame_interval', 0.5))
         self.query_memory_log_diagnostics = bool(
             self.query_memory_cfg.get('log_diagnostics', False))
         self.query_memory_diagnostics = []
@@ -213,8 +216,13 @@ class SparseWorld4DTraj(OPUS):
                 max_age=self.query_memory_cfg['max_age'],
                 lambda_position=self.query_memory_cfg['lambda_position'],
                 lambda_time=self.query_memory_cfg['lambda_time'],
+                lambda_reliability=self.query_memory_cfg.get(
+                    'lambda_reliability'),
                 lambda_confidence=self.query_memory_cfg['lambda_confidence'],
                 dropout=self.query_memory_cfg['dropout'],
+                motion_compensation=self.query_memory_cfg.get(
+                    'motion_compensation', True),
+                max_velocity=self.query_memory_cfg.get('max_velocity', 20.0),
                 pc_range=self.pc_range)
             if self.query_memory_source == 'online':
                 self.query_memory_bank = QueryMemoryBank(
@@ -222,7 +230,27 @@ class SparseWorld4DTraj(OPUS):
                     max_queries_per_frame=self.query_memory_cfg[
                         'max_queries_per_frame'],
                     write_threshold=self.query_memory_cfg['write_threshold'],
-                    max_time_gap=self.query_memory_cfg.get('max_time_gap'))
+                    max_time_gap=self.query_memory_cfg.get('max_time_gap'),
+                    history_selection_mode=self.query_memory_cfg.get(
+                        'history_selection_mode', 'recent'),
+                    history_target_ages=self.query_memory_cfg.get(
+                        'history_target_ages', [2.5, 3.5, 4.5]),
+                    history_age_tolerance=self.query_memory_cfg.get(
+                        'history_age_tolerance', 0.35),
+                    visual_history_window=self.query_memory_cfg.get(
+                        'visual_history_window', 2.0),
+                    retention_seconds=self.query_memory_cfg.get(
+                        'retention_seconds', 5.0),
+                    max_bank_entries=self.query_memory_cfg.get(
+                        'max_bank_entries', 16),
+                    min_reliability=self.query_memory_cfg.get(
+                        'min_reliability', 0.0),
+                    spatial_cell_size=self.query_memory_cfg.get(
+                        'spatial_cell_size', 4.0),
+                    max_per_spatial_cell=self.query_memory_cfg.get(
+                        'max_per_spatial_cell', 16),
+                    max_per_class=self.query_memory_cfg.get(
+                        'max_per_class', 64))
             # Freeze STAC-QM params during training (not trained yet)
             for param in self.query_memory.parameters():
                 param.requires_grad = False
@@ -294,32 +322,85 @@ class SparseWorld4DTraj(OPUS):
         return result
 
 
+    # legacy query_memory_cfg keys -> canonical STAC-QM keys. Mapping is applied
+    # with a single explicit warning and NEVER silently changes meaning.
+    _QUERY_MEMORY_LEGACY_KEYS = {
+        'lambda_confidence': 'lambda_reliability',
+        'memory_conf': 'min_reliability',
+        'confidence_threshold': 'write_threshold',
+        'bank_size': 'history_frames',
+    }
+
     def _build_query_memory_cfg(self, query_memory_cfg, legacy_cfg):
         cfg = dict(
             enabled=False,
             source='cache',
+            # --- history selection (Problem 6) ---
+            history_selection_mode='target_age',
             history_frames=3,
+            history_target_ages=[2.5, 3.5, 4.5],
+            history_age_tolerance=0.35,
+            visual_history_window=2.0,
+            retention_seconds=5.0,
+            max_bank_entries=16,
+            frame_interval=0.5,
+            # --- diversity selection (Problem 5) ---
             max_queries_per_frame=256,
+            min_reliability=0.0,
+            spatial_cell_size=4.0,
+            max_per_spatial_cell=16,
+            max_per_class=64,
             write_threshold=0.35,
+            # --- attention / fusion ---
             embed_dims=256,
             num_heads=8,
             spatial_radius=12.0,
             topk=32,
-            max_age=3.0,
+            max_age=8.0,
             lambda_position=1.0,
             lambda_time=1.0,
+            lambda_reliability=1.0,
+            # kept for the CausalQueryMemoryAttention legacy alias
             lambda_confidence=1.0,
             dropout=0.0,
+            # --- motion compensation (Problem 3) ---
+            motion_compensation=True,
+            max_velocity=20.0,
+            # --- misc ---
             max_time_gap=None,
+            schema_version=2,
             log_diagnostics=False,
             freeze_base_model=False,
         )
-        if query_memory_cfg is None:
+        user_cfg = query_memory_cfg
+        if user_cfg is None:
+            # legacy constructor-arg path (memory_* kwargs)
             if legacy_cfg.get('enabled', False):
-                cfg.update(legacy_cfg)
-            return cfg
-        cfg.update(query_memory_cfg)
+                user_cfg = legacy_cfg
+            else:
+                return cfg
+        cfg.update(self._map_legacy_query_memory_keys(dict(user_cfg)))
         return cfg
+
+    def _map_legacy_query_memory_keys(self, user_cfg):
+        legacy_present = [
+            k for k in self._QUERY_MEMORY_LEGACY_KEYS if k in user_cfg]
+        # lambda_confidence is still a live kwarg of CausalQueryMemoryAttention;
+        # only *remap* it when the canonical lambda_reliability is absent.
+        for legacy_key in legacy_present:
+            canonical = self._QUERY_MEMORY_LEGACY_KEYS[legacy_key]
+            if canonical in user_cfg:
+                continue
+            user_cfg[canonical] = user_cfg[legacy_key]
+        if legacy_present:
+            warnings.warn(
+                'STAC-QM query_memory_cfg received legacy keys '
+                f'{legacy_present}; mapped to '
+                f'{[self._QUERY_MEMORY_LEGACY_KEYS[k] for k in legacy_present]}'
+                '. These legacy keys are deprecated and will be removed; '
+                'update the config to the canonical keys.',
+                DeprecationWarning)
+        return user_cfg
 
     def _freeze_base_for_query_memory(self):
         for name, param in self.named_parameters():
@@ -406,7 +487,7 @@ class SparseWorld4DTraj(OPUS):
             missing = [key for key in required if key not in kwargs]
             if missing:
                 return None
-            return dict(
+            context = dict(
                 memory_query_feat=self._tensor_from_memory_kwargs(
                     kwargs, 'memory_query_feat', device, dtype),
                 memory_points_metric=self._tensor_from_memory_kwargs(
@@ -419,6 +500,15 @@ class SparseWorld4DTraj(OPUS):
                     kwargs, 'memory_source_ego2global', device, torch.float32),
                 memory_age=self._tensor_from_memory_kwargs(
                     kwargs, 'memory_age', device, torch.float32))
+            # schema-v2 optional fields (Problem 4). Absent for v1 caches, in
+            # which case STAC-QM falls back to memory_conf as reliability.
+            if 'memory_reliability' in kwargs:
+                context['memory_reliability'] = self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_reliability', device, torch.float32)
+            if 'memory_label' in kwargs:
+                context['memory_label'] = self._tensor_from_memory_kwargs(
+                    kwargs, 'memory_label', device, torch.long)
+            return context
 
         if self.training:
             return None  # STAC-QM params frozen, memory skipped during training
@@ -441,7 +531,7 @@ class SparseWorld4DTraj(OPUS):
             dtype=dtype)
 
     def _apply_query_memory_once(self, query_feat, query_pos, query_cls,
-                                 img_metas, memory_context):
+                                 img_metas, memory_context, future_offset=0.0):
         if not self.query_memory_enabled:
             return query_feat
         if memory_context is None:
@@ -455,7 +545,8 @@ class SparseWorld4DTraj(OPUS):
             query_points_metric=query_points_metric,
             current_confidence=query_conf,
             memory=memory_context,
-            target_ego2global=target_ego2global)
+            target_ego2global=target_ego2global,
+            future_offset=future_offset)
         if self.query_memory_log_diagnostics:
             self.query_memory_diagnostics.append({
                 key: value.detach().cpu() if isinstance(value, torch.Tensor)
@@ -560,6 +651,14 @@ class SparseWorld4DTraj(OPUS):
         else:
             memory_context = None
 
+        # Problem 1 (single-read) + Problem 2 (future-aware age):
+        # the observation queries read history memory EXACTLY ONCE, before the
+        # SCF recursion, at effective_age = base_age + 0. Already-fused active
+        # queries are never re-read inside the loop.
+        curr_query_feat = self._apply_query_memory_once(
+            curr_query_feat, curr_query_pos, curr_query_cls_for_memory,
+            img_metas, memory_context, future_offset=0.0)
+
         forecast_points_list = list()
         forecast_semantics_list = list()
         pred_trajs_list = list()
@@ -570,10 +669,10 @@ class SparseWorld4DTraj(OPUS):
             num_fu_frames = self.num_fu_frames
 
         for interval in range(num_fu_frames):
-            # fu_query_feat = outs['fu_query_feat'].reshape(B,self.num_fu_frames,self.num_fu_query,self.out_dim)
-            curr_query_feat = self._apply_query_memory_once(
-                curr_query_feat, curr_query_pos, curr_query_cls_for_memory,
-                img_metas, memory_context)
+            # NOTE: the observation queries were already fused ONCE before this
+            # loop and are NOT re-read here (Problem 1). Only the scheduled
+            # future-query group added this step reads memory, and it does so
+            # exactly once (below), with its own future_offset (Problem 2).
             fused_ego_feat,_ = self.ego_cross_attn(ego_feat.new_ones(B, 1, 3)*0.5, ego_feat, curr_query_pos.detach(),
                                                     curr_query_feat.detach(), )
             pred_traj = self.traj_head(fused_ego_feat)
@@ -584,9 +683,13 @@ class SparseWorld4DTraj(OPUS):
             scheduled_pos = query_pos[:, scheduled_mask].detach()
             scheduled_cls = query_cls[:, scheduled_mask]
             if scheduled_feat.shape[1] > 0:
+                # scheduled future-query group `interval` reads memory ONCE, at
+                # effective_age = base_age + (interval + 1) * frame_interval.
+                scheduled_future_offset = (
+                    interval + 1) * self.query_memory_frame_interval
                 scheduled_feat = self._apply_query_memory_once(
                     scheduled_feat, scheduled_pos, scheduled_cls, img_metas,
-                    memory_context)
+                    memory_context, future_offset=scheduled_future_offset)
                 curr_query_feat = torch.cat(
                     [curr_query_feat, scheduled_feat], dim=1)
                 curr_query_pos = torch.cat(

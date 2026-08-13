@@ -145,6 +145,10 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
                 query_memory_history_frames=3,
                 query_memory_max_queries_per_frame=256,
                 query_memory_strict=False,
+                query_memory_history_selection_mode='recent',
+                query_memory_history_target_ages=(2.5, 3.5, 4.5),
+                query_memory_history_age_tolerance=0.35,
+                query_memory_visual_history_window=2.0,
                 wrs_use_batch=False,
                 **kwargs):
         super().__init__(**kwargs)
@@ -153,6 +157,15 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         self.query_memory_max_queries_per_frame = int(
             query_memory_max_queries_per_frame)
         self.query_memory_strict = bool(query_memory_strict)
+        # Problem 6: target-age history slot selection.
+        self.query_memory_history_selection_mode = str(
+            query_memory_history_selection_mode)
+        self.query_memory_history_target_ages = [
+            float(a) for a in query_memory_history_target_ages]
+        self.query_memory_history_age_tolerance = float(
+            query_memory_history_age_tolerance)
+        self.query_memory_visual_history_window = float(
+            query_memory_visual_history_window)
         self.use_rays = use_rays
         self.if_dense = if_dense
         self.semantic_gt_path = semantic_gt_path
@@ -227,29 +240,82 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
     def _query_memory_frame_idx(self, info, fallback_index):
         return int(info.get('frame_idx', fallback_index))
 
-    def _build_query_memory_history_infos(self, index):
-        if self.query_memory_history_frames <= 0:
-            return []
+    def _hist_info_dict(self, hist, hist_index):
+        return dict(
+            sample_idx=str(hist['token']),
+            scene_id=str(self._query_memory_scene_id(hist)),
+            scene_token=hist.get('scene_token', None),
+            scene_name=hist.get('scene_name', None),
+            frame_idx=self._query_memory_frame_idx(hist, hist_index),
+            timestamp=self._query_memory_timestamp(hist))
+
+    def _collect_causal_history(self, index):
+        """All strictly-past same-scene frames, oldest first, with base age."""
         current = self.data_infos[index]
         current_scene = self._query_memory_scene_id(current)
         current_ts = self._query_memory_timestamp(current)
-        history_infos = []
+        candidates = []
         hist_index = index - 1
-        while hist_index >= 0 and len(history_infos) < self.query_memory_history_frames:
+        while hist_index >= 0:
             hist = self.data_infos[hist_index]
             if self._query_memory_scene_id(hist) != current_scene:
                 break
             hist_ts = self._query_memory_timestamp(hist)
             if hist_ts < current_ts:
-                history_infos.append(dict(
-                    sample_idx=str(hist['token']),
-                    scene_id=str(self._query_memory_scene_id(hist)),
-                    scene_token=hist.get('scene_token', None),
-                    scene_name=hist.get('scene_name', None),
-                    frame_idx=self._query_memory_frame_idx(hist, hist_index),
-                    timestamp=hist_ts))
+                info = self._hist_info_dict(hist, hist_index)
+                info['base_age'] = current_ts - hist_ts
+                candidates.append(info)
             hist_index -= 1
-        history_infos.reverse()
+        candidates.reverse()  # oldest -> newest
+        return candidates
+
+    def _build_query_memory_history_infos(self, index):
+        if self.query_memory_history_frames <= 0 and \
+                self.query_memory_history_selection_mode != 'target_age':
+            return []
+        if self.query_memory_history_selection_mode == 'target_age':
+            return self._build_target_age_history_infos(index)
+        # 'recent' compatibility mode: most recent history_frames frames.
+        candidates = self._collect_causal_history(index)
+        history_infos = candidates[-self.query_memory_history_frames:]
+        for info in history_infos:
+            info.pop('base_age', None)
+        return history_infos
+
+    def _build_target_age_history_infos(self, index):
+        """Assign one strictly-past frame to each target-age slot (Problem 6).
+
+        Slot ``j`` takes the causal same-scene frame whose base age is closest
+        to ``history_target_ages[j]`` within ``history_age_tolerance``. No frame
+        is used by two slots; slots with no in-tolerance frame are omitted. The
+        emitted ``slot_index`` follows ``history_target_ages`` order exactly.
+        """
+        candidates = self._collect_causal_history(index)
+        if not candidates:
+            return []
+        tol = self.query_memory_history_age_tolerance
+        used = set()
+        history_infos = []
+        for slot_index, target in enumerate(self.query_memory_history_target_ages):
+            best = None
+            best_gap = None
+            for cand_idx, info in enumerate(candidates):
+                if cand_idx in used:
+                    continue
+                gap = abs(info['base_age'] - target)
+                if gap > tol:
+                    continue
+                if best is None or gap < best_gap:
+                    best = cand_idx
+                    best_gap = gap
+            if best is None:
+                continue
+            used.add(best)
+            info = dict(candidates[best])
+            info.pop('base_age', None)
+            info['slot_index'] = slot_index
+            info['target_age'] = float(target)
+            history_infos.append(info)
         return history_infos
     
     def load_annotations(self, ann_file):

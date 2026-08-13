@@ -8,14 +8,20 @@ from mmcv.runner import load_checkpoint
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
 from mmdet3d.models.sparsedetectors.query_memory import (
-    decode_points_metric, logits_to_query_confidence)
+    decode_points_metric, logits_to_query_confidence,
+    compute_query_reliability, select_diverse_memory_queries)
 
+
+# Schema v2 (Problem 4/5): adds per-query semantic reliability + label so the
+# loader / online bank can run reliability-aware attention and class-diverse
+# selection. query_conf is retained for schema-v1 backward compatibility.
+CACHE_SCHEMA_VERSION = 2
 
 REQUIRED_CACHE_KEYS = [
     'schema_version', 'sample_idx', 'scene_id', 'frame_idx', 'timestamp',
     'ego2global', 'query_feat', 'query_points_metric', 'query_conf',
-    'valid_mask', 'pc_range', 'embed_dims', 'num_points', 'num_classes',
-    'source_config', 'source_checkpoint'
+    'query_reliability', 'query_label', 'valid_mask', 'pc_range', 'embed_dims',
+    'num_points', 'num_classes', 'source_config', 'source_checkpoint'
 ]
 
 
@@ -28,6 +34,10 @@ def parse_args():
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--max-queries-per-frame', type=int, default=256)
     parser.add_argument('--write-threshold', type=float, default=0.35)
+    parser.add_argument('--min-reliability', type=float, default=0.0)
+    parser.add_argument('--spatial-cell-size', type=float, default=4.0)
+    parser.add_argument('--max-per-spatial-cell', type=int, default=16)
+    parser.add_argument('--max-per-class', type=int, default=64)
     parser.add_argument('--workers-per-gpu', type=int, default=2)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--skip-existing', action='store_true',
@@ -80,14 +90,22 @@ def output_path(output_dir, scene_id, sample_idx):
     return Path(output_dir) / scene_id / f'{sample_idx}.pt'
 
 
-def select_queries(query_feat, query_points_metric, query_conf,
-                   max_queries_per_frame, write_threshold):
+def select_queries(query_points_metric, reliability, query_conf, labels,
+                   max_queries_per_frame, write_threshold, min_reliability,
+                   spatial_cell_size, max_per_spatial_cell, max_per_class):
+    # gate low-confidence queries out first (parity with the write_threshold),
+    # then apply the shared deterministic diversity selection.
     valid = query_conf >= write_threshold
-    indices = torch.nonzero(valid, as_tuple=False).flatten()
-    if indices.numel() > max_queries_per_frame:
-        _, order = torch.topk(query_conf[indices], max_queries_per_frame)
-        indices = indices[order]
-    return indices
+    return select_diverse_memory_queries(
+        query_points_metric,
+        reliability,
+        valid=valid,
+        labels=labels,
+        max_queries=max_queries_per_frame,
+        min_reliability=min_reliability,
+        spatial_cell_size=spatial_cell_size,
+        max_per_spatial_cell=max_per_spatial_cell,
+        max_per_class=max_per_class)
 
 
 def build_cache_record(model, outs, img_meta, args):
@@ -99,15 +117,23 @@ def build_cache_record(model, outs, img_meta, args):
     query_points_metric = decode_points_metric(
         query_points, model.pts_bbox_head.pc_range)
     query_conf = logits_to_query_confidence(query_logits)
+    rel = compute_query_reliability(query_logits)
+    query_reliability = rel['query_reliability']
+    query_label = rel['query_label']
 
     if query_feat.shape[0] != 1:
         raise RuntimeError('precompute_query_memory expects batch_size=1')
     indices = select_queries(
-        query_feat[0].detach().float().cpu(),
         query_points_metric[0].detach().float().cpu(),
+        query_reliability[0].detach().float().cpu(),
         query_conf[0].detach().float().cpu(),
+        query_label[0].detach().cpu(),
         args.max_queries_per_frame,
-        args.write_threshold)
+        args.write_threshold,
+        args.min_reliability,
+        args.spatial_cell_size,
+        args.max_per_spatial_cell,
+        args.max_per_class)
     sample_idx = str(meta_value(img_meta, 'sample_idx'))
     scene_id = scene_id_from_meta(img_meta)
     ego2global = img_meta.get('ego2global', None)
@@ -118,7 +144,7 @@ def build_cache_record(model, outs, img_meta, args):
     else:
         ego2global = torch.as_tensor(ego2global, dtype=torch.float32)
     cache = dict(
-        schema_version=1,
+        schema_version=CACHE_SCHEMA_VERSION,
         sample_idx=sample_idx,
         scene_id=scene_id,
         frame_idx=frame_idx_from_meta(img_meta),
@@ -127,6 +153,8 @@ def build_cache_record(model, outs, img_meta, args):
         query_feat=query_feat[0, indices].detach().cpu(),
         query_points_metric=query_points_metric[0, indices].detach().cpu(),
         query_conf=query_conf[0, indices].detach().cpu(),
+        query_reliability=query_reliability[0, indices].detach().cpu(),
+        query_label=query_label[0, indices].detach().cpu(),
         valid_mask=torch.ones(indices.numel(), dtype=torch.bool),
         pc_range=model.pts_bbox_head.pc_range.detach().cpu().tolist(),
         embed_dims=int(query_feat.shape[-1]),
@@ -151,6 +179,10 @@ def validate_cache_record(cache):
         raise ValueError('query_points_metric must be [M, R, 3]')
     if cache['query_conf'].shape != (M,):
         raise ValueError('query_conf must be [M]')
+    if cache['query_reliability'].shape != (M,):
+        raise ValueError('query_reliability must be [M]')
+    if cache['query_label'].shape != (M,):
+        raise ValueError('query_label must be [M]')
     if cache['valid_mask'].shape != (M,):
         raise ValueError('valid_mask must be [M]')
     if tuple(cache['ego2global'].shape) != (4, 4):

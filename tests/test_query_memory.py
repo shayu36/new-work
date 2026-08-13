@@ -258,3 +258,151 @@ def test_configuration_errors_are_clear():
     with pytest.raises(ValueError, match='spatial_radius'):
         qm.CausalQueryMemoryAttention(
             embed_dims=8, num_heads=2, spatial_radius=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Problem 4 - per-query semantic reliability (schema v2)
+# ---------------------------------------------------------------------------
+def test_compute_query_reliability_keys_range_and_empty_label():
+    logits = torch.tensor([[[3.0, 0.0, 0.0], [3.0, 0.0, 0.0]]])  # [1, R, C]
+    rel = qm.compute_query_reliability(logits)
+    for key in ('query_semantic_distribution', 'query_label', 'query_margin',
+                'query_entropy', 'query_reliability'):
+        assert key in rel
+    assert rel['query_reliability'].shape == (1,)
+    assert 0.0 <= float(rel['query_reliability'][0]) <= 1.0
+    assert int(rel['query_label'][0]) == 0
+
+    # empty query (R == 0) must produce label -1 and zero reliability, no NaN.
+    empty = qm.compute_query_reliability(torch.zeros(1, 0, 3))
+    assert int(empty['query_label'][0]) == -1
+    assert float(empty['query_reliability'][0]) == 0.0
+    assert torch.isfinite(empty['query_reliability']).all()
+
+
+def test_compute_query_reliability_peaked_beats_uniform():
+    peaked = torch.full((1, 2, 4), 0.0)
+    peaked[..., 0] = 10.0                       # sharply concentrated
+    uniform = torch.zeros(1, 2, 4)              # maximally ambiguous
+    logits = torch.cat([peaked, uniform], dim=0)  # [2, R, C]
+    rel = qm.compute_query_reliability(logits)
+    assert float(rel['query_reliability'][0]) > float(rel['query_reliability'][1])
+    assert float(rel['query_margin'][0]) > float(rel['query_margin'][1])
+    assert (rel['query_reliability'] >= 0).all()
+    assert (rel['query_reliability'] <= 1).all()
+
+
+# ---------------------------------------------------------------------------
+# Problem 2 - future-aware effective age
+# ---------------------------------------------------------------------------
+def test_compute_effective_age_obs_and_scheduled_offsets():
+    base = torch.tensor([1.0, 2.0, 3.0])
+    # observation query keeps its base age (offset 0).
+    assert torch.equal(qm.compute_effective_age(base, 0.0), base)
+    # scheduled future group k uses (k+1) * frame_interval.
+    frame_interval = 0.5
+    for k in range(3):
+        offset = (k + 1) * frame_interval
+        got = qm.compute_effective_age(base, offset)
+        assert torch.allclose(got, base + offset)
+    # scalar base is promoted to a tensor.
+    assert torch.allclose(
+        qm.compute_effective_age(2.0, 0.5), torch.tensor(2.5))
+
+
+# ---------------------------------------------------------------------------
+# Problem 5 - deterministic reliability + class + spatial diversity selection
+# ---------------------------------------------------------------------------
+def _spread_points(x_centers, R=2):
+    pts = torch.zeros(len(x_centers), R, 3)
+    for i, x in enumerate(x_centers):
+        pts[i, :, 0] = float(x)
+    return pts
+
+
+def test_select_diverse_deterministic_and_reliability_ordered():
+    reliability = torch.tensor([0.1, 0.9, 0.5, 0.7])
+    points = _spread_points([0.0, 100.0, 200.0, 300.0])  # all distinct cells
+    idx_a = qm.select_diverse_memory_queries(
+        points, reliability, valid=None, labels=None, max_queries=4,
+        spatial_cell_size=4.0, max_per_spatial_cell=16, max_per_class=64)
+    idx_b = qm.select_diverse_memory_queries(
+        points, reliability, valid=None, labels=None, max_queries=4,
+        spatial_cell_size=4.0, max_per_spatial_cell=16, max_per_class=64)
+    # deterministic + reliability-descending when every query is a novel cell.
+    assert torch.equal(idx_a, idx_b)
+    assert idx_a.tolist() == [1, 3, 2, 0]
+
+
+def test_select_diverse_spatial_and_class_caps():
+    reliability = torch.tensor([0.9, 0.8, 0.7, 0.6])
+    # (a) spatial cap: all queries in one cell, cap of 2 -> only 2 survive.
+    same_cell = _spread_points([0.0, 0.0, 0.0, 0.0])
+    sel = qm.select_diverse_memory_queries(
+        same_cell, reliability, labels=None, max_queries=10,
+        spatial_cell_size=4.0, max_per_spatial_cell=2, max_per_class=64)
+    assert sel.numel() == 2
+    assert sel.tolist() == [0, 1]  # top-2 reliability
+    # (b) class cap: distinct cells but one class, cap of 2 -> only 2 survive.
+    distinct = _spread_points([0.0, 100.0, 200.0, 300.0])
+    labels = torch.zeros(4, dtype=torch.long)
+    sel_c = qm.select_diverse_memory_queries(
+        distinct, reliability, labels=labels, max_queries=10,
+        spatial_cell_size=4.0, max_per_spatial_cell=16, max_per_class=2)
+    assert sel_c.numel() == 2
+    assert sel_c.tolist() == [0, 1]
+
+
+def test_select_diverse_v1_unknown_labels_degrades():
+    # schema-v1 fallback: all labels == -1 must DISABLE the class constraint.
+    reliability = torch.tensor([0.9, 0.8, 0.7])
+    distinct = _spread_points([0.0, 100.0, 200.0])
+    labels = torch.full((3,), -1, dtype=torch.long)
+    sel = qm.select_diverse_memory_queries(
+        distinct, reliability, labels=labels, max_queries=10,
+        spatial_cell_size=4.0, max_per_spatial_cell=16, max_per_class=1)
+    assert sel.numel() == 3  # class cap ignored because labels are unknown
+    # min_reliability gate drops low-reliability queries.
+    gated = qm.select_diverse_memory_queries(
+        distinct, reliability, labels=labels, max_queries=10,
+        min_reliability=0.75, spatial_cell_size=4.0,
+        max_per_spatial_cell=16, max_per_class=64)
+    assert gated.tolist() == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Problem 3 - zero-initialized motion compensator
+# ---------------------------------------------------------------------------
+def test_motion_compensator_zero_init_is_noop():
+    comp = qm.QueryMotionCompensator(embed_dims=8, max_velocity=20.0, max_age=8.0)
+    feat = torch.randn(1, 1, 3, 8)
+    age = torch.full((1, 1, 3), 2.0)
+    velocity = comp(feat, age)
+    assert velocity.shape == (1, 1, 3, 3)
+    # last layer is zero-initialized -> exact no-op until trained.
+    assert torch.equal(velocity, torch.zeros_like(velocity))
+
+
+# ---------------------------------------------------------------------------
+# Problem 4 - reliability drives the attention score
+# ---------------------------------------------------------------------------
+def test_attention_prefers_higher_reliability_memory():
+    attn = qm.CausalQueryMemoryAttention(
+        embed_dims=8, num_heads=2, spatial_radius=50.0, topk=8,
+        max_age=10.0, dropout=0.0)
+    query_feat = torch.randn(1, 1, 8)
+    query_points = torch.zeros(1, 1, 2, 3)
+    shared = torch.randn(8)
+    mem_feat = shared.view(1, 1, 1, 8).repeat(1, 1, 2, 1)  # identical k/v
+    mem_points = torch.zeros(1, 1, 2, 2, 3)                # co-located, in range
+    mem_conf = torch.ones(1, 1, 2)
+    mem_age = torch.ones(1, 1, 2)
+    mem_valid = torch.ones(1, 1, 2, dtype=torch.bool)
+    mem_rel = torch.tensor([[[0.99, 0.01]]])
+    _, diag = attn(
+        query_feat, query_points, mem_feat, mem_points, mem_conf, mem_age,
+        mem_valid, memory_reliability=mem_rel)
+    assert diag['has_candidate'].any()
+    # identical features => only the reliability term differentiates the two;
+    # weight collapses onto the high-reliability candidate.
+    assert float(diag['support_reliability'][0, 0]) > 0.5
