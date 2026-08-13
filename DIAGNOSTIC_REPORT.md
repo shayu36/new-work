@@ -158,3 +158,64 @@ checkpoint: `work_dirs/stacqm/epoch_51.pth`
 
 3. 缓存时间戳单位: 预计算用 `float(info['timestamp'])/1e6` (微秒转秒),
    确认 eval 时 meta timestamp 单位一致。
+
+## Memory 评估结果 (epoch_51, val 4,219 样本, 2026-08-12)
+
+评估配置: `sparseworld-traj-finetune-stacqm-val.py` (val 缓存 +
+log_diagnostics=True), 评估脚本 `tools/test_temporal.py --eval segm`
+
+| 指标 | Baseline (无Memory) | Memory (cache) | 差异 |
+|------|--------------------|----------------|------|
+| mIoU@0s | 14.72 | 14.72 | 0 |
+| mIoU@1s | 12.32 | 12.32 | 0 |
+| mIoU@2s | 11.10 | 11.10 | 0 |
+| mIoU@3s | 9.84 | 9.84 | 0 |
+| IoU@0s | 24.28 | 24.28 | 0 |
+| IoU@1s | 21.93 | 21.93 | 0 |
+| IoU@2s | 21.27 | 21.27 | 0 |
+| IoU@3s | 20.35 | 20.35 | 0 |
+
+17 类逐类别 IoU: Memory 与 Baseline 完全相同 (逐类别也零差异)。
+
+### Memory 内部诊断量 (memory_eval_ep51_memory_diag.json, 23.3M query 样本)
+
+| 诊断量 | mean | std | min | max | 解读 |
+|--------|------|-----|-----|-----|------|
+| has_candidate | 0.941 | 0.237 | 0 | 1 | 94% query 有候选 ✅ |
+| candidate_count | 110.7 | 90.8 | 0 | 628 | 空间半径内候选充足 ✅ |
+| topk_candidate_count | 27.5 | 9.8 | 0 | 32 | topk=32 平均选中 27.5 ✅ |
+| support_conf | 0.837 | 0.218 | 0 | 0.991 | 支持帧置信度正常 ✅ |
+| avg_distance | 7.74m | 2.24 | 0 | 12.0 | 空间距离合理 ✅ |
+| avg_age | 0.879s | 0.263 | 0 | 1.70 | 时间因果性正常 ✅ |
+| **avg_gate** | **0.0175** | **0.0044** | **0** | **0.0194** | ❌ gate 恒接近 0 |
+
+### 根因分析: Memory 输出恒等于 Baseline
+
+`ConfidenceGatedFusion` 初始化:
+- `out_proj.weight` / `out_proj.bias` 零初始化 (`nn.init.zeros_`)
+- `gate_mlp` 末层 bias 初始化为 -4.0 → gate = sigmoid(-4) ≈ 0.018
+- STAC-QM 全部参数训练时冻结 (`requires_grad=False`),
+  且训练时 `_query_memory_context` 直接返回 None (memory 从不参与训练 forward)
+
+因此:
+```
+fused = query_feat + has_candidate × gate × out_proj(memory_output)
+      = query_feat + has_candidate × 0.018 × 0
+      = query_feat   (精确恒等)
+```
+
+**Memory 数学上恒等于 Baseline。** 基础设施 (缓存生成/加载/对齐/注意力候选筛选)
+全部正常 (诊断量 has_candidate=94%, candidate_count=110), 但 STAC-QM
+从未被训练, 冻结在初始化状态, 输出被零初始化设计为恒等 fallback。
+
+### Q/K/V 梯度范数
+
+N/A — STAC-QM 参数 `requires_grad=False`, 梯度恒为 0。且训练时
+`_query_memory_context` 返回 None, memory 分支不参与计算图。
+
+### 修复方向
+
+1. 解冻 `query_memory.*` 参数 (移除 `param.requires_grad = False`)
+2. 训练时让 memory 参与 forward (移除 `if self.training: return None`)
+3. 跑 STAC-QM 微调训练 (freeze_base_model=True 或全参数微调)
+4. 重新评估对比 Baseline

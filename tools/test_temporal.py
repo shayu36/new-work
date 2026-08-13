@@ -137,6 +137,51 @@ def parse_args():
     return args
 
 
+def _dump_query_memory_diagnostics(model, args, cfg):
+    """Aggregate and dump STAC-QM diagnostics collected during eval."""
+    try:
+        base = model.module if hasattr(model, 'module') else model
+        diags = getattr(base, 'query_memory_diagnostics', None)
+        if not diags:
+            return
+        import json
+        import numpy as np
+        keys = ['has_candidate', 'support_conf', 'candidate_count',
+                'topk_candidate_count', 'avg_distance', 'avg_age', 'avg_gate']
+        stats = {}
+        for key in keys:
+            vals = []
+            for d in diags:
+                v = d.get(key)
+                if isinstance(v, torch.Tensor):
+                    vals.append(v.float().reshape(-1))
+                elif isinstance(v, (list, tuple)) and v and isinstance(
+                        v[0], torch.Tensor):
+                    vals.extend([x.float().reshape(-1) for x in v])
+                elif isinstance(v, (int, float, bool)):
+                    vals.append(torch.tensor([float(v)]))
+            if not vals:
+                continue
+            cat = torch.cat(vals).cpu().numpy()
+            stats[key] = dict(
+                mean=float(np.mean(cat)), std=float(np.std(cat)),
+                min=float(np.min(cat)), max=float(np.max(cat)),
+                count=int(cat.size))
+        stats['num_samples_with_diag'] = len(diags)
+        stats['attention_shape'] = diags[0].get('attention_shape') if diags else None
+        out_path = args.out.replace('.pkl', '_memory_diag.json') \
+            if args.out else 'work_dirs/memory_diag.json'
+        with open(out_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f'=== STAC-QM diagnostics dumped to {out_path} ===')
+        for key, s in stats.items():
+            if isinstance(s, dict) and 'mean' in s:
+                print(f'{key}: mean={s["mean"]:.4f} std={s["std"]:.4f} '
+                      f'min={s["min"]:.4f} max={s["max"]:.4f} n={s["count"]}')
+    except Exception as e:
+        print(f'[WARN] failed to dump query memory diagnostics: {e}')
+
+
 def main():
     args = parse_args()
 
@@ -258,6 +303,8 @@ def main():
 
     rank, _ = get_dist_info()
     if rank == 0:
+        # dump STAC-QM diagnostics if collected
+        _dump_query_memory_diagnostics(model, args, cfg)
         kwargs = {} if args.eval_options is None else args.eval_optionsz
         if args.eval:
             eval_kwargs = cfg.get('evaluation', {}).copy()
