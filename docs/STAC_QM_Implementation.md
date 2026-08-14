@@ -1,118 +1,246 @@
-# STAC-QM Implementation
+# STAC-QM Implementation and Runbook
 
-This repository now implements STAC-QM: Spatio-Temporally Aligned and Confidence-Gated Causal Query Memory for SparseWorld trajectory forecasting.
+STAC-QM adds Spatio-Temporally Aligned, Reliability-Gated Causal Query Memory to SparseWorld trajectory forecasting. The authoritative modeling and safety details are in [STAC_QM_Modeling_Repair.md](STAC_QM_Modeling_Repair.md).
 
-## Scope
+## Implemented Data Flow
 
-The first version uses only observation memory from real past frames. It does not add predicted query memory, instance tracking, fixed query-index matching, or an independent confidence head.
-
-> **Modeling-structure repair (2026-08).** Six modeling-structure repairs have
-> since been applied (single-read control flow, future-aware age, a
-> zero-initialized motion residual, per-query semantic reliability, deterministic
-> diversity selection, and target-age history selection). See
-> [STAC_QM_Modeling_Repair.md](STAC_QM_Modeling_Repair.md) for the authoritative
-> description. This section documents the original v1 behavior; where the two
-> differ, the repair doc governs. No training or evaluation has been run as part
-> of the repair — only the modeling structure and synthetic CPU tests changed.
-
-## Memory Record
-
-Each observation memory record stores CPU-detached tensors before STAC-QM fusion:
-
-- `query_feat`: raw RAP observation query feature `[M, C]`
-- `query_points_metric`: full decoded metric point set `[M, R, 3]`
-- `query_conf`: sigmoid-max-mean confidence `[M]`
-- `valid_mask`: valid cache rows `[M]`
-- `ego2global`: source ego-to-global pose `[4, 4]`
-- `timestamp`, `frame_idx`, `scene_id`, `sample_idx`
-
-Only `ind_stamps_all == 0` observation queries are written. Future scheduled queries and fused/SCF outputs are never written.
-
-## Training Data Flow
+Only raw observation queries from real past frames are cached:
 
 ```text
-past real observation frame
--> baseline SparseWorld RAP precompute script
--> per-sample query cache under <cache_root>/<scene>/<sample>.pt
--> NuScenesDatasetOccpancy4DTraj builds same-scene strictly past history_infos
--> LoadQueryMemoryFromFiles loads/pads K x M cache tensors
--> SparseWorld4DTraj source='cache'
--> every SCF interval reads aligned observation memory
--> confidence-gated residual updates active/scheduled query features
--> original SCF refine/classification/velocity/loss flow
+base SparseWorld RAP observation queries
+  -> schema-v2 per-sample cache
+  -> target-age same-scene history selection
+  -> ego-pose alignment
+  -> zero-initialized motion residual
+  -> reliability-aware causal attention
+  -> confidence-gated residual fusion
+  -> original recursive SCF future prediction
 ```
 
-`configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune-stacqm.py` enables stage A by setting `freeze_base_model=True`, so only `query_memory.*` parameters remain trainable.
+STAC-QM does not add predicted-query memory, instance tracking, query-to-track conversion, dynamic/static query splitting, SCF parallelization, fixed OccWorld tokens, or VQ-VAE.
 
-## Online Inference Flow
+## Schema-v2 Cache Record
+
+Each selected observation-query record contains:
 
 ```text
-read query_memory_bank for current frame metadata
--> run RAP and STAC-QM-enhanced SCF
--> after prediction, write raw current observation query to query_memory_bank
+query_feat                     [M, C]
+query_points_metric            [M, R, 3]
+query_conf                     [M]
+query_semantic_distribution    [M, C_sem]
+query_label                    [M]
+query_margin                   [M]
+query_entropy                  [M]
+query_reliability              [M]
+valid_mask                     [M]
+ego2global                     [4, 4]
+timestamp, frame_idx, scene_id, sample_idx
+pc_range, embed_dims, num_points, num_classes
+source_config, source_checkpoint, schema_version
 ```
 
-The online bank is strict batch-size one. It clears on scene change, frame rollback, timestamp rollback, or configured time-gap reset. It filters the current frame and duplicate frames, so the current sample cannot read itself.
+Schema v1 remains readable with `query_reliability=query_conf` and `query_label=-1`. Formal Memory-only runs require complete schema-v2 caches.
 
 ## SCF Integration
 
-STAC-QM is inserted without rewriting the original SCF loop:
+Memory reads are bounded by construction:
 
-- The observation queries are fused **once**, before the SCF interval loop begins.
-- After the scheduled queries for an interval are appended, only that new scheduled slice is fused **once**, with a future-aware age offset of `(interval + 1) * frame_interval`.
-- Already-fused active queries are never re-read on later intervals — each query reads real history memory at most once (repair Problem 1).
-- The original interval count, query schedule, causal mask, position encoding, `ego_cross_attn`, branches, moving mask, `refine_points`, detach behavior, losses, and output dictionaries are preserved.
+- observation queries read once before SCF at `future_offset=0`;
+- each of six scheduled groups reads once when introduced;
+- already-active queries never re-read Memory.
 
-## Attention And Fusion
-
-`CausalQueryMemoryAttention` performs real multi-head attention with `[B, H, Q, d_head]` and `[B, H, M, d_head]` tensors. Candidate filtering requires:
+Default runtime expectation:
 
 ```text
-memory_valid
-age = current_timestamp - source_timestamp > 0
-age <= max_age
-distance <= spatial_radius
-per-query, per-head Top-K
+query counts:   [720, 60, 60, 60, 60, 40, 40]
+future offsets: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+reads:          7
+fused queries:  1040
 ```
 
-The masked softmax is safe for fully invalid rows: weights and readout are exactly zero and no NaN/Inf is produced.
+## Configurations
 
-`ConfidenceGatedFusion` uses:
+### Split Cache Roots
 
 ```text
-LN(q), LN(h), LN(q-h), current_confidence, support_confidence
+train: data/query_memory/sparseworld_epoch56_schema2_train
+val:   data/query_memory/sparseworld_epoch56_schema2_val
+test:  data/query_memory/sparseworld_epoch56_schema2_val
 ```
 
-The final output is:
+Train, val, and test routes are assigned separately. Formal loaders use `strict=True`.
+
+### Formal Memory-Only Config
 
 ```text
-q + has_candidate * gate * W_o(h)
+configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py
 ```
 
-There is no unconditional LayerNorm on the final output, so empty memory and no-candidate rows are exact identity.
+It sets:
 
-## Cache Precompute
+- `load_from='ckpts/epoch_56.pth'`;
+- `resume_from=None`;
+- `memory_finetune_mode=True`;
+- `freeze_base_model=True`;
+- `source='cache'`;
+- AdamW, LR `1e-4`, weight decay `1e-2`;
+- gradient clipping at norm 5;
+- 12 epochs and one checkpoint per epoch.
 
-`tools/query_memory/precompute_query_memory.py` runs a baseline config/checkpoint in eval/no_grad mode and saves cache files. As of the modeling repair it writes **schema version 2**, adding per-query `query_reliability` and `query_label`, and uses the shared deterministic diversity selection. Schema-v1 caches remain loadable (reliability degrades to `query_conf`, label to `-1`). It refuses to overwrite existing files unless `--overwrite` is passed.
+Only `query_memory.*` is trainable and optimized. TASS assignment is finalized once after checkpoint loading and then asserted immutable.
 
-Example:
+### Connectivity Smoke Config
+
+```text
+configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only-smoke.py
+```
+
+This is a separate 200-iteration run. Its optimizer hook checks base gradients/state, TASS immutability, 7/1040 runtime behavior, and gradient connectivity for fusion and attention. It reports motion connectivity without claiming success when the motion final layer has no gradient.
+
+## User-Run Commands
+
+These commands require the repository's real nuScenes data, checkpoint, and GPU environment. They were prepared but **not run** in the implementation session.
+
+### 1. Generate Train Cache
 
 ```bash
-python tools/query_memory/precompute_query_memory.py \
-  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune.py \
-  --checkpoint ckpts/baseline.pth \
+/data/jxy/projects/env/bin/python tools/query_memory/precompute_query_memory.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --checkpoint ckpts/epoch_56.pth \
   --split train \
-  --output-dir data/query_memory/sparseworld_train \
+  --output-dir data/query_memory/sparseworld_epoch56_schema2_train \
   --max-queries-per-frame 256 \
-  --write-threshold 0.35
+  --write-threshold 0.35 \
+  --min-reliability 0.0 \
+  --spatial-cell-size 4.0 \
+  --max-per-spatial-cell 16 \
+  --max-per-class 64 \
+  --workers-per-gpu 2 \
+  --skip-existing
 ```
 
-Do not commit generated cache files.
+### 2. Generate Val Cache
 
-## Baseline Compatibility
+```bash
+/data/jxy/projects/env/bin/python tools/query_memory/precompute_query_memory.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --checkpoint ckpts/epoch_56.pth \
+  --split val \
+  --output-dir data/query_memory/sparseworld_epoch56_schema2_val \
+  --max-queries-per-frame 256 \
+  --write-threshold 0.35 \
+  --min-reliability 0.0 \
+  --spatial-cell-size 4.0 \
+  --max-per-spatial-cell 16 \
+  --max-per-class 64 \
+  --workers-per-gpu 2 \
+  --skip-existing
+```
 
-When `query_memory_cfg is None` or `enabled=False`, SparseWorld4DTraj does not read cache, align poses, run attention/fusion, or write the online bank. The original forward path, loss inputs, output format, and old checkpoint behavior are preserved. New checkpoint missing keys should be limited to `query_memory.*` when STAC-QM is enabled.
+Do not pass `--overwrite` unless replacing existing caches is intentional and verified.
 
-## Synthetic Validation
+### 3. Audit Train and Val Caches
 
-`tests/test_query_memory.py` and `tests/test_query_memory_integration.py` use only temporary synthetic tensors and temporary cache files (CPU only, no dataset/checkpoint/GPU). Together they cover ego-pose alignment, confidence computation, multi-head shapes, age/radius/top-k filtering, safe all-invalid behavior, exact identity fallback, scene isolation, online read-before-write behavior, loader padding, strict missing-cache behavior, configuration errors, per-query reliability, future-aware effective age, deterministic diversity selection (spatial/class caps + v1 degradation), the zero-initialized motion compensator, reliability-weighted attention, target-age history slot assignment (bank + loader), schema-v1/v2 loader behavior, and the future-offset causal filter. See [STAC_QM_Modeling_Repair.md](STAC_QM_Modeling_Repair.md#test-results) for the full case list and the tests that could not be run in this phase.
+```bash
+/data/jxy/projects/env/bin/python tools/query_memory/audit_query_memory_cache.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --split train \
+  --expected-schema-version 2 \
+  --expected-source-checkpoint ckpts/epoch_56.pth \
+  --json-out work_dirs/stacqm_cache_audit_train.json
+```
+
+```bash
+/data/jxy/projects/env/bin/python tools/query_memory/audit_query_memory_cache.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --split val \
+  --expected-schema-version 2 \
+  --expected-source-checkpoint ckpts/epoch_56.pth \
+  --json-out work_dirs/stacqm_cache_audit_val.json
+```
+
+Do not continue to training if either audit exits nonzero.
+
+### 4. Run Zero-Initialization C0/C1 Identity
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python \
+  tools/query_memory/check_query_memory_identity.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --checkpoint ckpts/epoch_56.pth \
+  --mode zero \
+  --split val \
+  --gpu-id 0 \
+  --atol 1e-6
+```
+
+The tool automatically chooses the first sample with all target-age slots unless `--sample-index` is specified. It must report valid histories/candidates, 7 reads, 1040 fused queries, zero residual, and identity within `1e-6`.
+
+### 5. Run the 200-Iteration Connectivity Smoke
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python tools/train.py \
+  configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only-smoke.py \
+  --work-dir work_dirs/sparseworld-traj-memory-only-smoke \
+  --gpu-id 0 \
+  --deterministic
+```
+
+Inspect the hook output and final run status. Do not treat a produced checkpoint alone as proof that connectivity checks passed.
+
+### 6. Check Trained Memory ON/OFF Behavior
+
+After a successful smoke run, point `--memory-checkpoint` to its checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python \
+  tools/query_memory/check_query_memory_identity.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --checkpoint ckpts/epoch_56.pth \
+  --memory-checkpoint work_dirs/sparseworld-traj-memory-only-smoke/iter_200.pth \
+  --mode trained \
+  --split val \
+  --gpu-id 0 \
+  --atol 1e-6 \
+  --min-future-diff 1e-6
+```
+
+This mode expects current-frame identity and a nonzero difference in at least one future output.
+
+### 7. Start Formal 12-Epoch Training
+
+Only after cache audits, C0/C1 identity, smoke connectivity, and trained ON/OFF checks pass:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python tools/train.py \
+  configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --work-dir work_dirs/sparseworld-traj-memory-only \
+  --gpu-id 0 \
+  --deterministic
+```
+
+Do not use `--auto-resume` for the initial run. The config loads `ckpts/epoch_56.pth` and sets `resume_from=None`.
+
+### 8. Evaluate a Formal Checkpoint
+
+Example only; replace the checkpoint path with an actually completed epoch:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python tools/test.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-only.py \
+  --checkpoint work_dirs/sparseworld-traj-memory-only/epoch_12.pth \
+  --gpu-id 0 \
+  --eval segm
+```
+
+No evaluation or ablation result is recorded until the command is run and its output is reviewed.
+
+## Completed Quick Verification
+
+The implementation session ran only static and synthetic checks:
+
+```text
+32 passed, 19 warnings in 4.24s
+```
+
+It also compiled the modified Python/config files, loaded all four STAC-QM configs, confirmed strict train/val/test routing, verified smoke-hook registration, and checked both new tools import successfully. No real cache generation, training, or evaluation was launched.

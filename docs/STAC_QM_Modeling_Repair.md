@@ -1,316 +1,264 @@
-# STAC-QM Modeling-Structure Repair
+# STAC-QM Modeling Repair and Memory-Only Acceptance
 
-This document records the 2026-08 modeling-structure-only repair for STAC-QM in SparseWorld4DTraj.
+This document records the STAC-QM modeling repair and the follow-up Memory-only training-safety implementation completed in 2026-08.
 
-## Scope And Non-Scope
+## Status
 
-Completed in this phase:
+Completed in code:
 
-- repaired the STAC-QM control flow and data structures for query-memory modeling;
-- added schema-v2 memory reliability / label fields with schema-v1 fallback;
-- added synthetic CPU tests covering the repaired behavior;
-- updated STAC-QM configs and cache tooling interfaces.
+- the six STAC-QM modeling repairs;
+- complete schema-v2 cache fields and strict validation;
+- runtime synthetic proof of 7 Memory reads and 1040 fused queries;
+- explicit `memory_finetune_mode=True` behavior;
+- frozen TASS temporal assignment after loading the base checkpoint;
+- query-memory-only optimizer construction and guarded smoke-training hooks;
+- split-specific strict train/val cache routing;
+- cache-audit and C0/C1 identity tools;
+- synthetic CPU tests and configuration compilation.
 
-Not completed in this phase:
+Not run in this repository session:
 
-- no training was started;
-- no full nuScenes evaluation was run;
-- no full train/val query cache was generated;
-- no metric improvement is claimed;
-- no optimizer, learning-rate schedule, epoch schedule, checkpoint loading, resume logic, TASS stage logic, `num_stamps_all`, or `ind_stamps_all` training-stage logic was intentionally changed.
+- full train or val cache generation;
+- cache-wide real-data audit;
+- real-data C0/C1 identity;
+- 100–500 iteration GPU smoke training;
+- 12-epoch Memory-only training;
+- nuScenes evaluation or ablations.
 
-This repair intentionally does **not** convert SparseWorld queries into track queries, split dynamic/static queries, parallelize SCF future prediction, copy OccWorld fixed-grid tokens, add VQ-VAE, or solve any untrained-parameter issue for `query_memory.*`.
+No metric improvement, cache completion, training success, or evaluation result is claimed. Generated `.pt` caches, checkpoints, datasets, prediction files, output PKLs, and large logs must not be committed.
 
-## Pre-Repair Audit
+## Six Modeling Repairs
 
-The previous STAC-QM wiring had six modeling issues:
+### 1. One Real-History Read Per Query
 
-1. **Repeated memory reads.** Active queries could re-read the same real history memory during each SCF interval, producing repeated memory injection rather than one causal read per query.
-2. **Future queries used base history age only.** Scheduled future query groups did not add their future offset to the memory age used by causal filtering, time penalty, and diagnostics.
-3. **No learnable residual motion compensation.** Ego-pose alignment handled ego motion only; there was no zero-initialized object-motion residual path.
-4. **Confidence was overloaded.** The cache stored `query_conf`, but did not store per-query semantic reliability, label, margin, entropy, or semantic distribution.
-5. **Query selection was not shared.** Cache generation, cache loading, and the online bank did not share a single deterministic reliability/class/spatial diversity selector.
-6. **History selection was recent-only.** The data path could not choose target-age history slots such as 2.5s / 3.5s / 4.5s with tolerance and no duplicate-frame assignment.
-
-## Repaired Modeling Flow
-
-### 1. Single Memory Read Per Query
-
-Observation queries read real history memory once before the SCF loop:
+Observation queries read Memory once before SCF:
 
 ```text
-obs_query_feat
+720 observation queries
   -> STAC-QM(memory, future_offset=0.0)
-  -> SCF interval loop
+  -> SCF recursion
 ```
 
-Scheduled future query group `k` reads real history memory once when appended:
+Each scheduled future-query group reads Memory once when introduced:
 
 ```text
-scheduled_query_group_k
-  -> STAC-QM(memory, future_offset=(k + 1) * frame_interval)
-  -> enters SCF scene update
+[60, 60, 60, 60, 40, 40]
+future_offset = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 ```
 
-Already-fused active queries are not re-read in later intervals. With the default schedule this bounds STAC-QM reads to:
+Already-active queries are never re-read. The default schedule therefore has:
 
 ```text
-1 observation read + 6 scheduled-group reads = 7 reads max
-720 observation queries + 320 scheduled queries = 1040 fused queries total
+7 Memory calls
+720 + 60 + 60 + 60 + 60 + 40 + 40 = 1040 fused queries
 ```
 
-This is a control-flow repair only; it does not change the SparseWorld query schedule itself.
+`tests/test_query_memory_integration.py` exercises the actual `SparseWorld4DTraj.forward_backbone()` control flow with lightweight CPU fakes and asserts those exact calls and offsets.
 
 ### 2. Future-Aware Effective Age
 
-Memory caches and the online bank store only base age:
+Caches retain immutable base timestamps/ages:
 
 ```text
 base_age = current_timestamp - history_timestamp
 ```
 
-Cached timestamps are never mutated. STAC-QM receives an explicit future offset and computes:
+At each read:
 
 ```text
 effective_age = base_age + future_offset
 ```
 
-where:
-
-```text
-future_offset = 0.0                         for observation queries
-future_offset = (k + 1) * frame_interval    for scheduled future group k
-```
-
-The causal filter, max-age filter, time penalty, motion compensation input, and diagnostics all use `effective_age`.
+Causal filtering, maximum-age filtering, temporal attention penalty, motion compensation, and diagnostics use `effective_age`. Cached timestamps are never modified.
 
 ### 3. Zero-Initialized Motion Compensation
 
-A learnable `QueryMotionCompensator` predicts a per-memory-query velocity:
+`QueryMotionCompensator` predicts a bounded per-memory-query velocity:
 
 ```text
-v_i = v_max * tanh(MLP([LN(m_i), phi(effective_age_i)]))
-P_hat_i = P_ego_aligned_i + effective_age_i * v_i
+velocity = v_max * tanh(MLP([LN(memory_feature), time_features]))
+aligned_points = ego_aligned_points + effective_age * velocity
 ```
 
-The final MLP layer is zero-initialized, so at initialization:
-
-```text
-v_i = 0
-P_hat_i = P_ego_aligned_i
-```
-
-Therefore the repaired model is exactly ego-alignment-only at initialization. The module can be disabled with `motion_compensation=False`.
+The final motion MLP layer is initialized to zero, so initial behavior is exactly ego-pose alignment only.
 
 ### 4. Per-Query Semantic Reliability
 
-Schema v2 stores additional per-query fields:
-
-- `query_semantic_distribution`
-- `query_label`
-- `query_margin`
-- `query_entropy`
-- `query_reliability`
-
-Reliability is computed from the point-averaged semantic distribution:
+Schema v2 stores:
 
 ```text
-top1 = max_c p_c
-margin = top1 - top2
-normalized_entropy = 1 - H(p) / log(C)
-query_reliability = mean(top1, margin, normalized_entropy)
+query_semantic_distribution [M, C_sem]
+query_label                 [M]
+query_margin                [M]
+query_entropy               [M]
+query_reliability           [M]
 ```
 
-The result is clamped to `[0, 1]`. This is semantic reliability over occupancy classes, **not foreground probability**.
-
-The old `query_conf` remains in the cache for schema-v1 compatibility. When a schema-v1 cache is loaded:
+Reliability is derived from top-1 probability, top-1/top-2 margin, and normalized entropy:
 
 ```text
+query_reliability = mean(top1, margin, 1 - H(p) / log(C))
+```
+
+The result is clamped to `[0, 1]`. `query_conf` remains for schema-v1 compatibility:
+
+```text
+schema v1 fallback:
 query_reliability = query_conf
 query_label = -1
 ```
 
-`CausalQueryMemoryAttention` uses reliability in the score:
-
-```text
-score = semantic_score
-      - lambda_position * distance^2 / radius^2
-      - lambda_time * effective_age / max_age
-      + lambda_reliability * log(query_reliability + eps)
-```
-
-Legacy `lambda_confidence` is mapped to the reliability weight with a one-time deprecation warning when legacy config keys are used.
+Schema-v2 validation checks exact shapes, finite values, valid ranges, and semantic-distribution row sums.
 
 ### 5. Shared Deterministic Diversity Selection
 
-The same function is used by:
+One `select_diverse_memory_queries(...)` implementation is used by:
 
-- `QueryMemoryBank.write(...)`
-- `LoadQueryMemoryFromFiles`
-- `tools/query_memory/precompute_query_memory.py`
+- cache precompute;
+- cache loading;
+- the online memory bank.
 
-Selection order is deterministic:
-
-1. filter invalid / too-low-reliability queries;
-2. sort by reliability descending with stable tie behavior;
-3. prefer novel spatial cells and novel classes;
-4. fill remaining capacity under `max_per_spatial_cell` and `max_per_class` caps.
-
-When schema-v1 labels are unavailable (`query_label == -1` for all queries), class diversity is disabled and selection degrades to reliability + spatial diversity.
+The selector filters invalid/low-reliability rows, sorts stably by reliability, favors novel classes and spatial cells, and then fills remaining capacity subject to class and cell caps. Schema-v1 caches degrade to reliability plus spatial diversity because their label is unknown (`-1`).
 
 ### 6. Target-Age History Selection
 
-`history_selection_mode='target_age'` supports target slots such as:
+The default repaired configuration uses:
 
 ```python
+history_selection_mode = 'target_age'
 history_target_ages = [2.5, 3.5, 4.5]
 history_age_tolerance = 0.35
-visual_history_window = 2.0
 ```
 
-The dataset selects strictly-past same-scene frames closest to each target age. A frame cannot occupy two slots. A slot remains invalid when no candidate is within tolerance. The dataset attaches:
+History candidates must be strictly past and from the same scene. Each target slot gets at most one frame, and one frame cannot fill multiple slots. Frames outside the dataset split's cache-generatable index space are excluded so strict cache loading does not request records the precompute dataloader cannot produce. Legacy `recent` mode remains supported.
 
-```text
-slot_index
-target_age
-```
+## Memory-Only Training Safety
 
-The loader preserves these slots instead of right-aligning them. The legacy `recent` mode remains available and retains the previous right-aligned history behavior.
+### Explicit Mode
 
-## File-Level Changes
-
-- `mmdet3d/models/sparsedetectors/query_memory.py`
-  - added `compute_query_reliability(...)`, `compute_effective_age(...)`, and `select_diverse_memory_queries(...)`;
-  - added schema-v2 reliability / label storage to the online bank;
-  - added target-age online-bank history selection;
-  - added zero-initialized `QueryMotionCompensator`;
-  - made attention use effective age and reliability-aware scoring;
-  - added diagnostics for support reliability, effective age, and motion residuals.
-
-- `mmdet3d/models/sparsedetectors/sparseworld_4d_traj.py`
-  - added full `query_memory_cfg` defaults and legacy-key mapping;
-  - changed SCF integration so observation queries and scheduled query groups read memory at most once;
-  - passed explicit `future_offset` into STAC-QM;
-  - passed schema-v2 memory fields through cache context;
-  - preserved disabled-mode tensor identity.
-
-- `mmdet3d/datasets/pipelines/loading_query_memory.py`
-  - added schema-v2 validation and schema-v1 fallback;
-  - added target-age slot placement;
-  - added shared deterministic diversity selection;
-  - now emits `memory_reliability` and `memory_label`.
-
-- `tools/query_memory/precompute_query_memory.py`
-  - bumped cache schema to v2;
-  - writes `query_reliability` and `query_label`;
-  - uses the shared diversity selector;
-  - added CLI knobs for reliability and diversity caps.
-
-- `mmdet3d/datasets/nuscenes_dataset_occ_trajectory.py`
-  - added dataset-side target-age history collection;
-  - added `slot_index` and `target_age` metadata;
-  - retained recent-mode compatibility.
-
-- `configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune-stacqm.py`
-  - expanded `query_memory_cfg` with repair parameters;
-  - configured target-age history selection and diversity selection;
-  - added schema-v2 loader keys to `Collect4D`;
-  - preserved optimizer / LR / runner / checkpoint fields.
-
-- `configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune-stacqm-val.py`
-  - applied the same modeling-repair config structure;
-  - preserved val-specific cache root and `log_diagnostics=True`.
-
-- `tests/test_query_memory.py`
-  - extended unit tests for reliability, future-aware age, diversity selection, motion no-op, and reliability-aware attention.
-
-- `tests/test_query_memory_integration.py`
-  - added synthetic CPU integration tests across bank, loader, and STAC-QM forward behavior.
-
-- `docs/STAC_QM_Implementation.md`
-  - updated to point to this modeling-repair document and describe the repaired SCF integration/cache schema.
-
-## Baseline Compatibility
-
-When query memory is disabled:
+Formal tuning uses:
 
 ```python
-query_memory_cfg = dict(enabled=False)
+query_memory_cfg = dict(
+    enabled=True,
+    source='cache',
+    memory_finetune_mode=True,
+    freeze_base_model=True)
 ```
 
-or equivalent config disables memory, the model does not read memory, align poses, run attention/fusion, or write the online bank. The repaired STAC-QM wrapper returns the original query tensor unchanged at tensor level:
+The mode rejects disabled Memory, online-memory training, or an unfrozen base model. Only `query_memory.*` parameters have `requires_grad=True`.
+
+### Optimizer Scope
+
+MMCV's default optimizer constructor includes frozen parameters. Therefore `mmdet3d/apis/train.py` builds the optimizer directly from `model.query_memory` in Memory-only mode.
+
+After checkpoint loading, `validate_query_memory_training_setup(...)` verifies:
+
+- every trainable parameter is under `query_memory.*`;
+- every optimizer parameter belongs to `query_memory.*`;
+- every trainable query-memory parameter is present in the optimizer;
+- the trainable parameter names and scalar count are logged.
+
+### Frozen TASS Assignment
+
+After `ckpts/epoch_56.pth` is loaded, Memory-only setup runs once:
+
+1. normalize restored `num_stamps_all`;
+2. derive `ind_stamps_all` once;
+3. rebuild RAP masks once;
+4. clone `num_stamps_all`, `ind_stamps_all`, and all RAP masks;
+5. set model/head `pretrain=False`;
+6. set `pts_bbox_head.freeze_tass_state=True`.
+
+The OPUS loss no longer accumulates into `num_stamps_all` while this guard is active. `set_epoch()` only records the epoch and asserts the frozen state. Every Memory-only iteration uses all six future horizons from the beginning.
+
+### Runtime Train/Eval Modes
+
+The root model remains `training=True`, allowing MMDetection to execute `forward_train()` and compute losses. During Memory-only training:
+
+- `query_memory` remains in training mode;
+- every base child module stays in evaluation mode;
+- frozen BN statistics and dropout behavior remain unchanged.
+
+Calling `eval()` still puts the whole model into evaluation mode.
+
+### Smoke Optimizer Guard
+
+`QueryMemoryConnectivityOptimizerHook` performs the normal backward/clip/step sequence and also:
+
+- rejects nonzero base-model gradients;
+- checks frozen TASS state every iteration;
+- logs gradient norms for fusion output/gate, attention Q/K/V, and the motion final layer;
+- requires fusion and Q/K/V connectivity after warm-up;
+- reports, but does not fabricate, motion-gradient connectivity;
+- asserts 7 reads and 1040 fused queries per forward;
+- logs valid slots, candidate counts, gates, residuals, effective age, and motion residuals;
+- hashes all base parameters and buffers before/after the run to detect any base or BN-state change.
+
+The hook is enabled only by the dedicated smoke config.
+
+## Strict Split Cache Routing
+
+Both repaired STAC-QM configs route caches as follows:
 
 ```text
-fused_query_feat is query_feat content-wise identical
+train -> data/query_memory/sparseworld_epoch56_schema2_train
+val   -> data/query_memory/sparseworld_epoch56_schema2_val
+test  -> data/query_memory/sparseworld_epoch56_schema2_val
 ```
 
-The SCF loop still uses the original query schedule, causal mask, branches, losses, and output dictionaries. The repair also avoids changes to optimizer, LR schedule, runner, checkpoint loading, resume behavior, and TASS training-stage logic.
+The shared dataset config no longer overrides the split root. Formal loaders and dataset metadata use `strict=True`, so selected missing histories fail instead of silently becoming empty Memory.
 
-Schema compatibility:
+Configs:
 
-```text
-schema v2: uses query_reliability + query_label
-schema v1: query_reliability = query_conf, query_label = -1
-```
+- `sparseworld-traj-finetune-stacqm.py`: repaired STAC-QM plumbing;
+- `sparseworld-traj-finetune-stacqm-val.py`: matching split-safe validation plumbing;
+- `sparseworld-traj-memory-only.py`: formal 12-epoch Memory-only run;
+- `sparseworld-traj-memory-only-smoke.py`: 200-iteration connectivity gate.
 
-## Test Results
+The original baseline config `sparseworld-traj-finetune.py` is unchanged.
 
-Synthetic CPU tests were run with:
+## Verification Tools
+
+### Cache Audit
+
+`tools/query_memory/audit_query_memory_cache.py` builds the actual configured dataset and reuses its target-age history selection plus loader validation. It reports:
+
+- split dataset/cache counts and current-sample coverage;
+- schema, source-checkpoint, and source-config distributions;
+- missing, corrupt, shape, scene, temporal, and noncausal failures;
+- target-age slot coverage;
+- reliability min/median/max;
+- class histogram and spatial-cell coverage.
+
+It exits nonzero when formal-cache failures are found.
+
+### C0/C1 Identity and Trained Difference
+
+`tools/query_memory/check_query_memory_identity.py` runs a real validation sample twice with identical base state:
+
+- C0: Memory disabled;
+- C1: cache Memory enabled.
+
+Zero-initialized mode requires `max_abs_diff <= 1e-6` for current logits/points, future logits/points, trajectory output, and final occupancy-evaluation inputs. It also requires valid Memory, candidates, 7 reads, 1040 fused queries, zero fusion projection, zero motion final layer, and zero applied residual.
+
+Trained mode requires current-frame identity while at least one future output differs, and requires a nonzero trained fusion projection/residual.
+
+## Synthetic Verification Result
+
+Executed:
 
 ```bash
-/data/jxy/projects/env/bin/python -m pytest tests/test_query_memory.py tests/test_query_memory_integration.py -q
+/data/jxy/projects/env/bin/python -m pytest -q \
+  tests/test_query_memory.py tests/test_query_memory_integration.py
 ```
 
-Observed result:
+Observed:
 
 ```text
-26 passed, 19 warnings in 4.32s
+32 passed, 19 warnings in 4.24s
 ```
 
-The 26 passing tests cover:
+The suite includes schema-v1/v2 behavior, reliability/diversity, effective age, target-age selection, cache-generatable history filtering, zero motion/fusion identity, real `forward_backbone()` 7/1040 instrumentation, Memory-only trainability/module modes, and TASS immutability.
 
-1. ego-pose identity / translation / rotation / batch isolation;
-2. sigmoid-max-mean query confidence;
-3. multi-head attention shape, age/radius/top-k filtering;
-4. all-invalid / empty-memory safe identity behavior;
-5. STAC disabled exact tensor identity;
-6. online-bank read-after-write causality and scene isolation;
-7. online-bank batch-size-one enforcement;
-8. cache-loader padding and non-strict missing-cache behavior;
-9. strict missing-cache error reporting;
-10. configuration validation errors;
-11. reliability keys, ranges, labels, and empty-query behavior;
-12. peaked semantic logits producing higher reliability than uniform logits;
-13. observation and scheduled effective-age offsets;
-14. deterministic reliability ordering;
-15. spatial diversity caps;
-16. class diversity caps;
-17. schema-v1 unknown-label degradation;
-18. zero-initialized motion compensator exact no-op;
-19. reliability-weighted attention preference;
-20. online-bank target-age slot assignment and tolerance;
-21. online-bank all-out-of-tolerance target-age read returns `None`;
-22. cache-loader target-age slot placement with schema-v2 fields;
-23. cache-loader schema-v1 reliability / label fallback;
-24. future offset affecting effective age and causal max-age filtering;
-25. motion compensation diagnostics after simulated trained shift;
-26. disabled STAC identity regardless of memory contents.
-
-Not run in this phase:
-
-- full query-cache generation;
-- full nuScenes train/val data loading;
-- SparseWorld4DTraj forward on real images;
-- training;
-- full nuScenes evaluation;
-- metric comparison.
-
-## Remaining Work For Later Phases
-
-Before making any performance claims, a later phase still needs to:
-
-1. generate real schema-v2 train/val cache files with the approved checkpoint;
-2. train the newly introduced `query_memory.*` parameters under the intended schedule;
-3. run validation / evaluation on the intended split;
-4. compare against the baseline with identical training/eval settings;
-5. inspect checkpoint missing/unexpected keys separately if checkpoint policy is changed in a future phase.
+Configuration inheritance/routing, hook registration, tool imports, and Python compilation were also checked. Real-data/GPU commands remain user-run and are not reported as successful here.

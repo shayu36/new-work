@@ -194,14 +194,20 @@ class SparseWorld4DTraj(OPUS):
             query_memory_cfg, legacy_memory_cfg)
         self.query_memory_enabled = bool(self.query_memory_cfg.get('enabled', False))
         self.memory_enabled = self.query_memory_enabled
+        self.memory_finetune_mode = bool(
+            self.query_memory_cfg.get('memory_finetune_mode', False))
         self.query_memory_source = self.query_memory_cfg.get('source', 'cache')
         self.query_memory_frame_interval = float(
             self.query_memory_cfg.get('frame_interval', 0.5))
         self.query_memory_log_diagnostics = bool(
             self.query_memory_cfg.get('log_diagnostics', False))
         self.query_memory_diagnostics = []
+        self._last_query_memory_valid_slots = 0.0
         self.query_memory = None
         self.query_memory_bank = None
+        self.frozen_num_stamps_all = None
+        self.frozen_ind_stamps_all = None
+        self._frozen_rap_masks = None
         if self.query_memory_enabled:
             if self.query_memory_source not in ('cache', 'online'):
                 raise ValueError(
@@ -251,11 +257,7 @@ class SparseWorld4DTraj(OPUS):
                         'max_per_spatial_cell', 16),
                     max_per_class=self.query_memory_cfg.get(
                         'max_per_class', 64))
-            # Freeze STAC-QM params during training (not trained yet)
-            for param in self.query_memory.parameters():
-                param.requires_grad = False
-        if self.query_memory_cfg.get('freeze_base_model', False):
-            self._freeze_base_for_query_memory()
+        self._configure_query_memory_trainability()
 
     def init_weights(self):
         self.pts_bbox_head.init_weights()
@@ -264,6 +266,11 @@ class SparseWorld4DTraj(OPUS):
 
     def set_epoch(self, epoch):
         self.curr_epoch = epoch
+        if self.memory_finetune_mode:
+            self.pretrain = False
+            self.pts_bbox_head.pretrain = False
+            self._assert_memory_finetune_temporal_state()
+            return
         if epoch<self.finetune_epoch:
             self.pretrain = True
             self.pts_bbox_head.pretrain = True
@@ -371,6 +378,7 @@ class SparseWorld4DTraj(OPUS):
             schema_version=2,
             log_diagnostics=False,
             freeze_base_model=False,
+            memory_finetune_mode=False,
         )
         user_cfg = query_memory_cfg
         if user_cfg is None:
@@ -402,21 +410,118 @@ class SparseWorld4DTraj(OPUS):
                 DeprecationWarning)
         return user_cfg
 
-    def _freeze_base_for_query_memory(self):
-        for name, param in self.named_parameters():
-            param.requires_grad = name.startswith('query_memory.')
+    def _configure_query_memory_trainability(self):
+        """Apply one deterministic trainability policy after module creation."""
+        freeze_base = bool(
+            self.query_memory_cfg.get('freeze_base_model', False))
+        if self.memory_finetune_mode:
+            if not self.query_memory_enabled or self.query_memory is None:
+                raise ValueError(
+                    'memory_finetune_mode=True requires enabled STAC-QM')
+            if self.query_memory_source != 'cache':
+                raise ValueError(
+                    'memory_finetune_mode=True requires source="cache"')
+            if not freeze_base:
+                raise ValueError(
+                    'memory_finetune_mode=True requires freeze_base_model=True')
 
-    def validate_query_memory_training_setup(self):
-        if not self.query_memory_enabled:
+        if freeze_base:
+            for name, param in self.named_parameters():
+                param.requires_grad = name.startswith('query_memory.')
+        elif self.query_memory is not None:
+            # Preserve the legacy non-finetune policy: query memory is inert unless
+            # the base-freezing / memory-only path is explicitly requested.
+            for param in self.query_memory.parameters():
+                param.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.memory_finetune_mode and mode:
+            # Keep the root in training mode so MMDetection executes forward_train
+            # and computes losses, but freeze every base child module's runtime
+            # state (BN statistics, dropout, and other train/eval behavior).
+            for name, module in self.named_children():
+                if name == 'query_memory':
+                    module.train(True)
+                else:
+                    module.eval()
+        return self
+
+    def _current_rap_masks(self):
+        masks = []
+        transformer = getattr(self.pts_bbox_head, 'transformer', None)
+        decoder = getattr(transformer, 'decoder', None)
+        layers = getattr(decoder, 'decoder_layers', [])
+        for layer in layers:
+            self_attn = getattr(layer, 'self_attn', None)
+            mask = getattr(self_attn, 'ind_mask', None)
+            if mask is not None:
+                masks.append(mask.detach().clone())
+        return masks
+
+    def _freeze_memory_finetune_temporal_state(self):
+        if not self.memory_finetune_mode:
             return
+        if self.frozen_num_stamps_all is not None:
+            self._assert_memory_finetune_temporal_state()
+            return
+        head = self.pts_bbox_head
+        if getattr(head, 'num_stamps_all', None) is None:
+            raise RuntimeError(
+                'memory_finetune_mode requires pts_bbox_head.num_stamps_all')
+        num_stamps = head.num_stamps_all.float()
+        denominator = num_stamps.sum(dim=-1, keepdim=True)
+        if (denominator <= 0).any():
+            raise RuntimeError('num_stamps_all contains an empty timestamp row')
+        normalized = num_stamps / denominator
+        head.ind_stamps_all = get_matched_inds(
+            normalized, [self.num_query] + self.num_fu_query)
+        head.reset_mask()
+        head.freeze_tass_state = True
+        self.pretrain = False
+        head.pretrain = False
+        self.frozen_num_stamps_all = head.num_stamps_all.detach().clone()
+        self.frozen_ind_stamps_all = head.ind_stamps_all.detach().clone()
+        self._frozen_rap_masks = self._current_rap_masks()
+
+    def _assert_memory_finetune_temporal_state(self):
+        if not self.memory_finetune_mode:
+            return
+        if self.frozen_num_stamps_all is None or \
+                self.frozen_ind_stamps_all is None:
+            raise RuntimeError(
+                'Memory-only temporal state was not finalized after checkpoint '
+                'loading. Call validate_query_memory_training_setup first.')
+        head = self.pts_bbox_head
+        if not torch.equal(head.num_stamps_all, self.frozen_num_stamps_all):
+            raise RuntimeError('num_stamps_all changed in memory_finetune_mode')
+        if not torch.equal(head.ind_stamps_all, self.frozen_ind_stamps_all):
+            raise RuntimeError('ind_stamps_all changed in memory_finetune_mode')
+        current_masks = self._current_rap_masks()
+        frozen_masks = self._frozen_rap_masks or []
+        if len(current_masks) != len(frozen_masks):
+            raise RuntimeError('RAP causal mask count changed in memory_finetune_mode')
+        for current, frozen in zip(current_masks, frozen_masks):
+            if not torch.equal(current, frozen):
+                raise RuntimeError('RAP causal mask changed in memory_finetune_mode')
+
+    def validate_query_memory_training_setup(self, optimizer=None, logger=None):
+        if not self.query_memory_enabled:
+            return dict(trainable_names=[], trainable_count=0)
+        if self.memory_finetune_mode:
+            self._freeze_memory_finetune_temporal_state()
         if self.query_memory_source == 'online' and self.training:
-            return  # allowed: STAC-QM params frozen, memory skipped during training
+            return dict(trainable_names=[], trainable_count=0)
+
+        trainable = [
+            (name, param) for name, param in self.named_parameters()
+            if param.requires_grad
+        ]
+        trainable_names = [name for name, _ in trainable]
         if self.query_memory_cfg.get('freeze_base_model', False):
-            trainable = [
-                name for name, param in self.named_parameters()
-                if param.requires_grad
-            ]
-            bad = [name for name in trainable if not name.startswith('query_memory.')]
+            bad = [
+                name for name in trainable_names
+                if not name.startswith('query_memory.')]
             if bad:
                 raise RuntimeError(
                     'freeze_base_model=True allows only query_memory.* to be '
@@ -424,6 +529,39 @@ class SparseWorld4DTraj(OPUS):
             if not trainable:
                 raise RuntimeError(
                     'freeze_base_model=True left no trainable parameters.')
+
+        if self.memory_finetune_mode and optimizer is not None:
+            query_ids = {
+                id(param): name for name, param in self.named_parameters()
+                if name.startswith('query_memory.') and param.requires_grad
+            }
+            optimizer_ids = {
+                id(param)
+                for group in optimizer.param_groups
+                for param in group['params']
+            }
+            unexpected = optimizer_ids - set(query_ids)
+            missing = set(query_ids) - optimizer_ids
+            if unexpected:
+                raise RuntimeError(
+                    'Memory-only optimizer contains non-query-memory parameters')
+            if missing:
+                missing_names = [query_ids[param_id] for param_id in missing]
+                raise RuntimeError(
+                    'Memory-only optimizer is missing trainable parameters: '
+                    f'{missing_names[:20]}')
+
+        trainable_count = sum(param.numel() for _, param in trainable)
+        message = (
+            'STAC-QM trainable parameters '
+            f'({trainable_count} scalars): {trainable_names}')
+        if logger is not None:
+            logger.info(message)
+        elif self.memory_finetune_mode:
+            print(message, flush=True)
+        return dict(
+            trainable_names=trainable_names,
+            trainable_count=trainable_count)
 
     def _meta_scene_id(self, meta):
         scene_id = meta.get('scene_token', None)
@@ -486,6 +624,10 @@ class SparseWorld4DTraj(OPUS):
             ]
             missing = [key for key in required if key not in kwargs]
             if missing:
+                if self.memory_finetune_mode:
+                    raise KeyError(
+                        'memory_finetune_mode requires cache tensors from the '
+                        f'strict loader; missing: {missing}')
                 return None
             context = dict(
                 memory_query_feat=self._tensor_from_memory_kwargs(
@@ -548,11 +690,14 @@ class SparseWorld4DTraj(OPUS):
             target_ego2global=target_ego2global,
             future_offset=future_offset)
         if self.query_memory_log_diagnostics:
-            self.query_memory_diagnostics.append({
+            call_diagnostics = {
                 key: value.detach().cpu() if isinstance(value, torch.Tensor)
                 else value
                 for key, value in diagnostics.items()
-            })
+            }
+            call_diagnostics['query_count'] = int(query_feat.shape[1])
+            call_diagnostics['future_offset'] = float(future_offset)
+            self.query_memory_diagnostics.append(call_diagnostics)
         return fused
 
     def _prepare_online_query_memory(self, img_metas):
@@ -612,6 +757,9 @@ class SparseWorld4DTraj(OPUS):
     def forward_backbone(self,img,img_metas,**kwargs):
 
         B = img.shape[0]
+        self._last_query_memory_valid_slots = 0.0
+        if self.query_memory_log_diagnostics:
+            self.query_memory_diagnostics.clear()
         ego_states = kwargs['temporal_ego_states'][0]
         bs, _, dim_ = ego_states.shape
         ego_states = ego_states.view((bs, 1, dim_))
@@ -648,6 +796,16 @@ class SparseWorld4DTraj(OPUS):
             memory_context = self._query_memory_context(
                 kwargs, img_metas, curr_query_feat.device,
                 curr_query_feat.dtype)
+            if memory_context is not None and hasattr(memory_context, 'get'):
+                memory_valid = memory_context.get('memory_valid')
+                if isinstance(memory_valid, torch.Tensor) and \
+                        memory_valid.numel():
+                    if memory_valid.ndim >= 3:
+                        valid_slots = memory_valid.any(dim=-1).float().sum(dim=-1)
+                    else:
+                        valid_slots = memory_valid.float().sum(dim=-1)
+                    self._last_query_memory_valid_slots = float(
+                        valid_slots.mean().item())
         else:
             memory_context = None
 
@@ -663,9 +821,15 @@ class SparseWorld4DTraj(OPUS):
         forecast_semantics_list = list()
         pred_trajs_list = list()
         forecast_points_mask_list = list()
-        if self.training:
-            num_fu_frames = max(1,min(self.curr_epoch - self.finetune_epoch+1, self.num_fu_frames))
+        if self.training and not self.memory_finetune_mode:
+            num_fu_frames = max(
+                1, min(
+                    self.curr_epoch - self.finetune_epoch + 1,
+                    self.num_fu_frames))
         else:
+            # Memory-only tuning always trains all configured future horizons
+            # from its first iteration; the original progressive schedule is
+            # retained outside memory_finetune_mode.
             num_fu_frames = self.num_fu_frames
 
         for interval in range(num_fu_frames):

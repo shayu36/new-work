@@ -232,8 +232,17 @@ def train_detector(model,
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
-    # build runner
-    optimizer = build_optimizer(model, cfg.optimizer)
+    # MMCV's default optimizer constructor includes frozen parameters, so
+    # explicit Memory-only tuning must target query_memory itself.
+    model_for_optimizer = model.module if hasattr(model, 'module') else model
+    if getattr(model_for_optimizer, 'memory_finetune_mode', False):
+        if getattr(model_for_optimizer, 'query_memory', None) is None:
+            raise RuntimeError(
+                'memory_finetune_mode has no query_memory optimizer target')
+        optimizer_target = model_for_optimizer.query_memory
+    else:
+        optimizer_target = model
+    optimizer = build_optimizer(optimizer_target, cfg.optimizer)
 
     if 'runner' not in cfg:
         cfg.runner = {
@@ -321,7 +330,8 @@ def train_detector(model,
     else:
         model_for_checks = runner.model
     if hasattr(model_for_checks, 'validate_query_memory_training_setup'):
-        model_for_checks.validate_query_memory_training_setup()
+        model_for_checks.validate_query_memory_training_setup(
+            optimizer=runner.optimizer, logger=logger)
     runner.run(data_loaders, cfg.workflow)
 
 

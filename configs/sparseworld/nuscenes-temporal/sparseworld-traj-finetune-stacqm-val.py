@@ -60,8 +60,10 @@ occ_names = [
 ]
 
 embed_dims = 256
-# val 评估专用: 使用 val 自己的缓存, 避免读取 train 缓存 (cross-split 泄漏/错配)
-query_memory_cache_root = './data/query_memory/sparseworld_val'
+query_memory_train_cache_root = (
+    './data/query_memory/sparseworld_epoch56_schema2_train')
+query_memory_val_cache_root = (
+    './data/query_memory/sparseworld_epoch56_schema2_val')
 query_memory_history_frames = 3
 query_memory_max_queries_per_frame = 256
 query_memory_write_threshold = 0.35
@@ -246,10 +248,10 @@ train_pipeline = [
     dict(type='LoadOccGTFromFile4DTraj'),
     dict(
         type='LoadQueryMemoryFromFiles',
-        cache_root=query_memory_cache_root,
+        cache_root=query_memory_train_cache_root,
         history_frames=query_memory_history_frames,
         max_queries_per_frame=query_memory_max_queries_per_frame,
-        strict=False,
+        strict=True,
         embed_dims=query_memory_embed_dims,
         num_points=query_memory_num_points,
         history_selection_mode=query_memory_history_selection_mode,
@@ -274,10 +276,10 @@ test_pipeline = [
     dict(type='LoadOccGTFromFile4DTraj'),  # For visualization...
     dict(
         type='LoadQueryMemoryFromFiles',
-        cache_root=query_memory_cache_root,
+        cache_root=query_memory_val_cache_root,
         history_frames=query_memory_history_frames,
         max_queries_per_frame=query_memory_max_queries_per_frame,
-        strict=False,
+        strict=True,
         embed_dims=query_memory_embed_dims,
         num_points=query_memory_num_points,
         history_selection_mode=query_memory_history_selection_mode,
@@ -321,10 +323,8 @@ share_data_config = dict(
     filter_empty_gt=False,
     img_info_prototype='bevdet4d',
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
-    query_memory_cache_root=query_memory_cache_root,
     query_memory_history_frames=query_memory_history_frames,
     query_memory_max_queries_per_frame=query_memory_max_queries_per_frame,
-    query_memory_strict=False,
     query_memory_history_selection_mode=query_memory_history_selection_mode,
     query_memory_history_target_ages=query_memory_history_target_ages,
     query_memory_history_age_tolerance=query_memory_history_age_tolerance,
@@ -333,7 +333,8 @@ share_data_config = dict(
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    # ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl')
+    query_memory_cache_root=query_memory_val_cache_root,
+    query_memory_strict=True,
     ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
 
 data = dict(
@@ -343,6 +344,8 @@ data = dict(
         data_root=data_root,
         ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',
         pipeline=train_pipeline,
+        query_memory_cache_root=query_memory_train_cache_root,
+        query_memory_strict=True,
         classes=class_names,
         test_mode=False,
         use_valid_flag=True,

@@ -170,9 +170,45 @@ class LoadQueryMemoryFromFiles(object):
             raise ValueError(f'{path} ego2global must be [4, 4]')
         M = query_feat.shape[0]
         if int(cache['schema_version']) >= 2:
-            for key in ('query_reliability', 'query_label'):
-                if key in cache and cache[key].shape[0] != M:
-                    raise ValueError(f'{path} {key} must share M with query_feat')
+            v2_required = [
+                'query_semantic_distribution', 'query_label', 'query_margin',
+                'query_entropy', 'query_reliability', 'num_classes'
+            ]
+            v2_missing = [key for key in v2_required if key not in cache]
+            if v2_missing:
+                raise KeyError(
+                    f'{path} schema-v2 cache missing keys: {v2_missing}')
+            num_classes = int(cache['num_classes'])
+            expected_shapes = dict(
+                query_semantic_distribution=(M, num_classes),
+                query_label=(M,),
+                query_margin=(M,),
+                query_entropy=(M,),
+                query_reliability=(M,))
+            for key, expected in expected_shapes.items():
+                if tuple(cache[key].shape) != expected:
+                    raise ValueError(
+                        f'{path} {key} must have shape {expected}, got '
+                        f'{tuple(cache[key].shape)}')
+            for key in ('query_semantic_distribution', 'query_margin',
+                        'query_entropy', 'query_reliability'):
+                if not torch.isfinite(cache[key]).all():
+                    raise ValueError(f'{path} {key} must be finite')
+            reliability = cache['query_reliability'].float()
+            margin = cache['query_margin'].float()
+            if ((reliability < 0) | (reliability > 1)).any():
+                raise ValueError(
+                    f'{path} query_reliability must be in [0, 1]')
+            if ((margin < 0) | (margin > 1)).any():
+                raise ValueError(f'{path} query_margin must be in [0, 1]')
+            distribution = cache['query_semantic_distribution'].float()
+            if ((distribution < 0) | (distribution > 1)).any():
+                raise ValueError(
+                    f'{path} query_semantic_distribution must be in [0, 1]')
+            if M > 0 and not torch.allclose(
+                    distribution.sum(dim=-1), torch.ones(M), atol=1e-5):
+                raise ValueError(
+                    f'{path} query_semantic_distribution rows must sum to 1')
         if hist is None:
             return
         hist_scene = self._hist_scene_id(hist)

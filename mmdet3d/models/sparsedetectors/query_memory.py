@@ -986,10 +986,13 @@ class ConfidenceGatedFusion(nn.Module):
         ], dim=-1)
         gate = torch.sigmoid(self.gate_mlp(gate_input))
         residual = self.out_proj(h.to(self.out_proj.weight.dtype)).to(orig_dtype)
-        fused = query_feat + has.unsqueeze(-1).to(orig_dtype) * gate.to(
-            orig_dtype) * residual
-        diagnostics = dict(avg_gate=(
-            gate.detach() * has.unsqueeze(-1).float()).mean(dim=-1))
+        applied_residual = (
+            has.unsqueeze(-1).to(orig_dtype) * gate.to(orig_dtype) * residual)
+        fused = query_feat + applied_residual
+        diagnostics = dict(
+            avg_gate=(
+                gate.detach() * has.unsqueeze(-1).float()).mean(dim=-1),
+            residual_norm=applied_residual.detach().float().norm(dim=-1))
         return fused, diagnostics
 
 
@@ -1155,4 +1158,5 @@ class STACQueryMemory(nn.Module):
             avg_age=torch.zeros(B, Q, device=device),
             effective_age=torch.zeros(B, Q, device=device),
             avg_gate=torch.zeros(B, Q, device=device),
+            residual_norm=torch.zeros(B, Q, device=device),
             attention_shape=(B, self.attention.num_heads, Q, 0))
