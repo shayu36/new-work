@@ -290,6 +290,29 @@ def test_future_offset_effective_age_and_causal_filter():
     assert torch.equal(fused1, query_feat)
 
 
+def test_empty_memory_training_identity_has_zero_gradient_graph():
+    stac = qm.STACQueryMemory(
+        enabled=True, embed_dims=8, num_heads=2, spatial_radius=100.0,
+        topk=8, max_age=8.0, dropout=0.0)
+    stac.train()
+    query_feat = torch.randn(1, 2, 8)
+    memory = _single_candidate_memory(base_age=2.0)
+    memory['memory_valid'].zero_()
+
+    fused, diagnostics = stac(
+        query_feat, torch.zeros(1, 2, 2, 3), torch.ones(1, 2),
+        memory=memory, target_ego2global=torch.eye(4).unsqueeze(0))
+
+    assert torch.equal(fused, query_feat)
+    assert not bool(diagnostics['has_candidate'].any())
+    loss = fused.square().mean()
+    assert loss.requires_grad
+    loss.backward()
+    grads = [param.grad for param in stac.parameters() if param.requires_grad]
+    assert grads and all(grad is not None for grad in grads)
+    assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
+
+
 def test_motion_compensation_toggle_and_trained_shift():
     query_feat = torch.randn(1, 1, 8)
     query_points = torch.zeros(1, 1, 2, 3)

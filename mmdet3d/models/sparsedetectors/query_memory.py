@@ -1054,7 +1054,8 @@ class STACQueryMemory(nn.Module):
         if memory is None:
             memory = memory_kwargs
         if not memory:
-            return query_feat, self._identity_diagnostics(query_feat)
+            identity = self._training_identity(query_feat)
+            return identity, self._identity_diagnostics(query_feat)
         memory_query_feat = memory.get('memory_query_feat')
         memory_points_metric = memory.get('memory_points_metric')
         memory_conf = memory.get('memory_conf')
@@ -1073,7 +1074,8 @@ class STACQueryMemory(nn.Module):
                 'memory_age')
         if memory_valid.numel() == 0 or not memory_valid.to(
                 query_feat.device).bool().any():
-            return query_feat, self._identity_diagnostics(query_feat)
+            identity = self._training_identity(query_feat)
+            return identity, self._identity_diagnostics(query_feat)
 
         if memory_query_feat.dim() == 3:
             memory_query_feat = memory_query_feat.unsqueeze(0)
@@ -1144,6 +1146,27 @@ class STACQueryMemory(nn.Module):
         diagnostics['future_offset'] = float(future_offset)
         diagnostics['effective_age_mean'] = effective_age.mean().detach()
         return fused, diagnostics
+
+    def _training_identity(self, query_feat):
+        """Keep empty-memory batches numerically exact but differentiable.
+
+        Scene-boundary samples can have no target-age history. In Memory-only
+        training the base model is frozen, so returning ``query_feat`` directly
+        would produce a loss with no grad_fn and make both smoke and formal
+        optimizer hooks fail. Zero-valued anchors give every trainable STAC-QM
+        parameter an explicit zero gradient without inventing connectivity.
+        """
+        if not self.training:
+            return query_feat
+        zero = query_feat.new_zeros(())
+        has_trainable = False
+        for param in self.parameters():
+            if param.requires_grad and param.numel():
+                zero = zero + param.reshape(-1)[0].to(query_feat.dtype) * 0.0
+                has_trainable = True
+        if not has_trainable:
+            return query_feat
+        return query_feat + zero
 
     def _identity_diagnostics(self, query_feat):
         B, Q = query_feat.shape[:2]

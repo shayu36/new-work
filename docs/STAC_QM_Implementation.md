@@ -87,7 +87,7 @@ It sets:
 - gradient clipping at norm 5;
 - 12 epochs and one checkpoint per epoch.
 
-Only `query_memory.*` is trainable and optimized. TASS assignment is finalized once after checkpoint loading and then asserted immutable.
+Only `query_memory.*` is trainable and optimized. TASS assignment is finalized once after checkpoint loading and then asserted immutable. Scene-boundary batches with no valid target-age history remain numerically exact identities while retaining a zero-valued Query Memory autograd bridge; backward therefore remains valid, and the zero gradients are not counted as connectivity evidence.
 
 ### Connectivity Smoke Config
 
@@ -99,7 +99,7 @@ This is a separate 200-iteration run. Its optimizer hook checks base gradients/s
 
 ## User-Run Commands
 
-These commands require the repository's real nuScenes data, checkpoint, and GPU environment. They were prepared but **not run** in the implementation session.
+These commands require the repository's real nuScenes data, checkpoint, and GPU environment. Cache generation, both audits, zero-initialization identity, the 200-iteration smoke, and trained ON/OFF identity have now been run successfully. Formal 12-epoch training and evaluation remain unrun.
 
 ### 1. Generate Train Cache
 
@@ -235,12 +235,25 @@ CUDA_VISIBLE_DEVICES=0 /data/jxy/projects/env/bin/python tools/test.py \
 
 No evaluation or ablation result is recorded until the command is run and its output is reviewed.
 
-## Completed Quick Verification
+## Completed Verification
 
-The implementation session ran only static and synthetic checks:
+### Static and Synthetic
 
 ```text
-32 passed, 19 warnings in 4.24s
+33 passed, 19 warnings in 4.28s
 ```
 
-It also compiled the modified Python/config files, loaded all four STAC-QM configs, confirmed strict train/val/test routing, verified smoke-hook registration, and checked both new tools import successfully. No real cache generation, training, or evaluation was launched.
+The additional regression test proves that a Memory-only batch with no valid historical slot remains an exact numerical identity but still supports backward with explicit zero gradients. Modified Python files compile, `git diff --check` passes, all four STAC-QM configs load, strict train/val/test routing is active, the smoke hook is registered, and both verification tools import successfully.
+
+### Real Cache and GPU Acceptance
+
+Observed on the configured nuScenes splits and `ckpts/epoch_56.pth`:
+
+- train schema-v2 cache: `19,730 / 19,730` records;
+- val schema-v2 cache: `4,219 / 4,219` records;
+- train and val audits: `failure_count=0`, no missing, corrupt, orphan, noncausal, scene, temporal, shape, schema, or source-checkpoint failures;
+- zero-initialization C0/C1: passed with exact `0.0` output differences, three valid history slots, 7 reads, 1040 fused queries, and zero residual;
+- 200-iteration connectivity smoke: completed with nonzero fusion output/gate, attention Q/K/V, and motion-final-layer gradients; 7/1040 held throughout, and the base parameter/buffer plus frozen TASS checks passed;
+- trained Memory ON/OFF: passed with exact current-frame identity, nonzero differences at all six future horizons, `out_proj_abs_max=0.0034669`, `motion_last_abs_max=0.0030774`, and `residual_norm_max=0.0197589`.
+
+Formal 12-epoch training, nuScenes evaluation, metrics, and ablations have not been run. Generated caches, checkpoints, and logs remain local artifacts and must not be committed.

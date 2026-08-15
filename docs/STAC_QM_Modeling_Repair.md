@@ -16,16 +16,20 @@ Completed in code:
 - cache-audit and C0/C1 identity tools;
 - synthetic CPU tests and configuration compilation.
 
-Not run in this repository session:
+Completed on real data/GPU:
 
-- full train or val cache generation;
-- cache-wide real-data audit;
-- real-data C0/C1 identity;
-- 100–500 iteration GPU smoke training;
+- full train and val schema-v2 cache generation;
+- cache-wide train and val audits with zero failures;
+- real-data zero-initialization C0/C1 identity;
+- 200-iteration guarded GPU smoke training;
+- trained Memory ON/OFF behavior verification.
+
+Not run:
+
 - 12-epoch Memory-only training;
-- nuScenes evaluation or ablations.
+- nuScenes evaluation, metrics, or ablations.
 
-No metric improvement, cache completion, training success, or evaluation result is claimed. Generated `.pt` caches, checkpoints, datasets, prediction files, output PKLs, and large logs must not be committed.
+No formal-training completion, metric improvement, or evaluation result is claimed. Generated `.pt` caches, checkpoints, datasets, prediction files, output PKLs, and large logs must not be committed.
 
 ## Six Modeling Repairs
 
@@ -182,6 +186,16 @@ The root model remains `training=True`, allowing MMDetection to execute `forward
 
 Calling `eval()` still puts the whole model into evaluation mode.
 
+### Empty-History Batch Safety
+
+Samples near a scene boundary may have no valid frame at any configured target age. Because the base model is frozen, returning the untouched base query directly would produce a loss with no `grad_fn` and crash both smoke and formal optimizer hooks. The identity path therefore adds a numerically zero autograd anchor to every trainable Query Memory parameter:
+
+- forward values remain exactly unchanged;
+- backward is valid;
+- all Query Memory gradients for that batch are explicitly zero;
+- zero gradients do not satisfy the smoke connectivity gate;
+- later batches with real Memory candidates must still provide the required nonzero connectivity.
+
 ### Smoke Optimizer Guard
 
 `QueryMemoryConnectivityOptimizerHook` performs the normal backward/clip/step sequence and also:
@@ -244,6 +258,20 @@ Zero-initialized mode requires `max_abs_diff <= 1e-6` for current logits/points,
 
 Trained mode requires current-frame identity while at least one future output differs, and requires a nonzero trained fusion projection/residual.
 
+## Real-Data Acceptance Results
+
+Using the configured nuScenes splits and `ckpts/epoch_56.pth`:
+
+- train cache: `19,730 / 19,730` schema-v2 records;
+- val cache: `4,219 / 4,219` schema-v2 records;
+- both complete audits reported `failure_count=0` with no missing, corrupt, orphan, noncausal, duplicate-history, scene, temporal, shape, schema, sample, or source-checkpoint failures;
+- target-age selected and loaded counts matched for every slot on both splits;
+- zero-initialization C0/C1 passed on val sample index 9 with three valid history slots, 7 reads, 1040 fused queries, zero fusion/motion residual, and exact `0.0` differences for all checked outputs;
+- the 200-iteration smoke completed with nonzero gradients for fusion output/gate, attention Q/K/V, and the motion final layer; its base parameter/buffer hashes and frozen TASS assertions passed;
+- trained ON/OFF verification retained exact current-frame identity while all six forecast horizons and trajectory output changed; observed maxima included `out_proj_abs_max=0.0034669`, `motion_last_abs_max=0.0030774`, and `residual_norm_max=0.0197589`.
+
+These are acceptance/safety results, not nuScenes quality metrics. Formal 12-epoch training and evaluation remain unrun.
+
 ## Synthetic Verification Result
 
 Executed:
@@ -256,9 +284,9 @@ Executed:
 Observed:
 
 ```text
-32 passed, 19 warnings in 4.24s
+33 passed, 19 warnings in 4.28s
 ```
 
-The suite includes schema-v1/v2 behavior, reliability/diversity, effective age, target-age selection, cache-generatable history filtering, zero motion/fusion identity, real `forward_backbone()` 7/1040 instrumentation, Memory-only trainability/module modes, and TASS immutability.
+The suite includes schema-v1/v2 behavior, reliability/diversity, effective age, target-age selection, cache-generatable history filtering, zero motion/fusion identity, empty-history zero-gradient backward safety, real `forward_backbone()` 7/1040 instrumentation, Memory-only trainability/module modes, and TASS immutability.
 
-Configuration inheritance/routing, hook registration, tool imports, and Python compilation were also checked. Real-data/GPU commands remain user-run and are not reported as successful here.
+Configuration inheritance/routing, hook registration, tool imports, Python compilation, and patch whitespace checks were also completed.
