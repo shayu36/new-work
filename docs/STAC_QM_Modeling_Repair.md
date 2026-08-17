@@ -24,12 +24,18 @@ Completed on real data/GPU:
 - 200-iteration guarded GPU smoke training;
 - trained Memory ON/OFF behavior verification.
 
-Not run:
+Completed after acceptance:
 
-- 12-epoch Memory-only training;
-- nuScenes evaluation, metrics, or ablations.
+- 12-epoch two-GPU Memory-only training with global batch size 4;
+- epoch-12 trained Memory ON/OFF behavior verification.
 
-No formal-training completion, metric improvement, or evaluation result is claimed. Generated `.pt` caches, checkpoints, datasets, prediction files, output PKLs, and large logs must not be committed.
+Completed effectiveness checks:
+
+- full 4,219-sample nuScenes validation for Memory ON and OFF;
+- epoch-5/8/12 occupancy comparisons;
+- planning L2 and collision comparison.
+
+The Memory-only path is functionally active but does not improve aggregate IoU/mIoU. A separate clean-start joint-finetune implementation is prepared to adapt STAC-QM together with future occupancy modules. Generated `.pt` caches, checkpoints, datasets, prediction files, output PKLs, and large logs must not be committed.
 
 ## Six Modeling Repairs
 
@@ -228,7 +234,9 @@ Configs:
 - `sparseworld-traj-finetune-stacqm.py`: repaired STAC-QM plumbing;
 - `sparseworld-traj-finetune-stacqm-val.py`: matching split-safe validation plumbing;
 - `sparseworld-traj-memory-only.py`: formal 12-epoch Memory-only run;
-- `sparseworld-traj-memory-only-smoke.py`: 200-iteration connectivity gate.
+- `sparseworld-traj-memory-only-smoke.py`: Memory-only connectivity gate;
+- `sparseworld-traj-memory-joint.py`: clean-start formal joint run;
+- `sparseworld-traj-memory-joint-smoke.py`: joint connectivity/frozen-state gate.
 
 The original baseline config `sparseworld-traj-finetune.py` is unchanged.
 
@@ -270,7 +278,40 @@ Using the configured nuScenes splits and `ckpts/epoch_56.pth`:
 - the 200-iteration smoke completed with nonzero gradients for fusion output/gate, attention Q/K/V, and the motion final layer; its base parameter/buffer hashes and frozen TASS assertions passed;
 - trained ON/OFF verification retained exact current-frame identity while all six forecast horizons and trajectory output changed; observed maxima included `out_proj_abs_max=0.0034669`, `motion_last_abs_max=0.0030774`, and `residual_norm_max=0.0197589`.
 
-These are acceptance/safety results, not nuScenes quality metrics. Formal 12-epoch training and evaluation remain unrun.
+Formal 12-epoch Memory-only training subsequently completed after 59,196 iterations. It ended cleanly without NaN/Inf; all 679 base-model tensors remained bitwise identical to `ckpts/epoch_56.pth`; and the final optimizer contained only the 29 trainable Query Memory tensors. Epoch-12 trained ON/OFF verification preserved exact current-frame identity while changing all six future horizons and trajectory output, with 7 reads, 1040 fused queries, three valid history slots, `out_proj_abs_max=0.0962831`, `motion_last_abs_max=0.0379095`, and `residual_norm_max=7.7569` on the checked validation sample.
+
+The inherited evaluation interval is 24 epochs, so the 12-epoch run did not evaluate during training. A subsequent fair 4,219-sample validation compared epoch-12 Memory ON against the unchanged epoch-56 Memory OFF base. ON reported `IoU=[25.68, 23.14, 22.28, 21.21]` and `mIoU=[18.20, 14.95, 13.17, 11.51]`; OFF reported `IoU=[25.68, 23.15, 22.27, 21.21]` and `mIoU=[18.20, 14.96, 13.18, 11.53]`. ON-minus-OFF mIoU was `[0.00, -0.01, -0.01, -0.02]`, and mean future mIoU changed by `-0.0133`.
+
+The repaired historical Query path is functionally active and training-safe, but the epoch-12 Memory-only checkpoint does not improve aggregate validation quality. Epoch-5 and epoch-8 evaluations were effectively tied with epoch 12, so the result is not explained by late-stage overfitting.
+
+## Clean-Start Joint Future-Occupancy Tuning
+
+A separate joint mode starts from `ckpts/epoch_56.pth` with zero-initialized STAC-QM and simultaneously trains:
+
+```text
+query_memory.*
+position_encoder.*
+reg_branch.*
+vel_branch.*
+cls_branch.*
+ego_cross_attn.*
+```
+
+ResNet, the image neck, `pts_bbox_head`, planning/trajectory heads, and TASS remain frozen. This boundary is required by the fixed schema-v2 caches: historical Query features stay in the epoch-56 observation-query space, so the current observation-query generator must not drift during training.
+
+The optimizer contains only trainable tensors and uses three LR tiers:
+
+```text
+query_memory.*                          5e-5
+position/reg/vel/cls future branches   1e-5
+ego_cross_attn.*                        5e-6
+```
+
+The formal config trains all six horizons from iteration one for 12 epochs with global batch size 4 and validates every epoch. A separate 200-iteration smoke hook checks joint gradient connectivity, exact optimizer membership, frozen parameter/buffer hashes, immutable TASS, and 7/1040 Memory behavior before the user launches formal training.
+
+The first formal launch saved `epoch_1.pth` and then exposed an incompatible generic MMDetection validation path: `SparseWorld4DTraj` returns a dictionary, while the generic test function attempted `result[0]`. `SparseWorld4DTraj` now marks its evaluation API explicitly, training selects dedicated single/distributed SparseWorld hooks, and the dedicated collector parses occupancy/trajectory dictionaries, restores distributed sampler order, and truncates padding to the exact dataset length. Generic detector models keep their existing MMDetection hooks.
+
+The epoch-1 resume completed epoch 2 and its full validation, then exposed a separate logger incompatibility because the evaluator returns four-element IoU/mIoU lists while TensorBoard accepts only scalars. The SparseWorld hooks now flatten temporal lists into per-horizon scalar metrics plus all-horizon and future-horizon means before updating the runner log buffer. `epoch_2.pth` was validated structurally (`meta.epoch=2`, `meta.iter=9866`, 710 model tensors, 63 optimizer groups, and 63 optimizer states) and is safe to resume at epoch 3.
 
 ## Synthetic Verification Result
 
@@ -284,9 +325,9 @@ Executed:
 Observed:
 
 ```text
-33 passed, 19 warnings in 4.28s
+47 passed, 19 warnings
 ```
 
-The suite includes schema-v1/v2 behavior, reliability/diversity, effective age, target-age selection, cache-generatable history filtering, zero motion/fusion identity, empty-history zero-gradient backward safety, real `forward_backbone()` 7/1040 instrumentation, Memory-only trainability/module modes, and TASS immutability.
+The suite includes schema-v1/v2 behavior, reliability/diversity, effective age, target-age selection, cache-generatable history filtering, zero motion/fusion identity, empty-history zero-gradient backward safety, real `forward_backbone()` 7/1040 instrumentation, Memory-only and joint trainability/module modes, TASS immutability, dictionary-result parsing, distributed ordering/padding truncation, and model-specific evaluation-hook routing.
 
 Configuration inheritance/routing, hook registration, tool imports, Python compilation, and patch whitespace checks were also completed.

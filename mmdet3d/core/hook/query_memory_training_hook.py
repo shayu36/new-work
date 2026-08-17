@@ -198,3 +198,98 @@ class QueryMemoryConnectivityOptimizerHook(OptimizerHook):
                 'Frozen base buffers/BN statistics changed during smoke run')
         if not self._connectivity_checked:
             self._check_connectivity(runner)
+
+
+@HOOKS.register_module()
+class QueryMemoryJointConnectivityOptimizerHook(
+        QueryMemoryConnectivityOptimizerHook):
+    """Connectivity and frozen-state guard for joint STAC-QM tuning."""
+
+    _GRAD_GROUPS = {
+        'fusion_out': ('query_memory.fusion.out_proj.weight',),
+        'fusion_gate': ('query_memory.fusion.gate_mlp.',),
+        'attention_q': ('query_memory.attention.q_proj.',),
+        'attention_k': ('query_memory.attention.k_proj.',),
+        'attention_v': ('query_memory.attention.v_proj.',),
+        'motion_last': ('query_memory.motion_compensator.mlp.2.',),
+        'position_encoder': ('position_encoder.',),
+        'reg_branch': ('reg_branch.',),
+        'vel_branch': ('vel_branch.',),
+        'cls_branch': ('cls_branch.',),
+        'ego_cross_attn': ('ego_cross_attn.',),
+    }
+
+    def before_run(self, runner):
+        model = _unwrap_model(runner.model)
+        if not getattr(model, 'memory_joint_finetune_mode', False):
+            raise RuntimeError(
+                'QueryMemoryJointConnectivityOptimizerHook requires '
+                'memory_joint_finetune_mode=True')
+        model.validate_query_memory_training_setup(
+            optimizer=runner.optimizer, logger=runner.logger)
+        self._base_parameter_digest = _tensor_digest([
+            (name, param) for name, param in model.named_parameters()
+            if not model.is_memory_tuning_parameter(name)
+        ])
+        self._base_buffer_digest = _tensor_digest([
+            (name, buffer) for name, buffer in model.named_buffers()
+            if not model.is_memory_tuning_parameter(name)
+        ])
+
+    def _gradient_metrics(self, model):
+        metrics = {key: 0.0 for key in self._GRAD_GROUPS}
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if not model.is_memory_tuning_parameter(name):
+                if grad is not None and torch.count_nonzero(grad).item() != 0:
+                    raise RuntimeError(
+                        f'Frozen parameter received gradient: {name}')
+                continue
+            if grad is None:
+                continue
+            grad_norm = float(grad.detach().float().norm().item())
+            for key, prefixes in self._GRAD_GROUPS.items():
+                if any(name == prefix or name.startswith(prefix)
+                       for prefix in prefixes):
+                    metrics[key] += grad_norm
+        for key, value in metrics.items():
+            if value > 0.0:
+                self._ever_nonzero[key] = True
+        return metrics
+
+    def _check_connectivity(self, runner):
+        required = (
+            'fusion_out', 'fusion_gate', 'attention_q', 'attention_k',
+            'attention_v', 'position_encoder', 'reg_branch', 'vel_branch',
+            'cls_branch', 'ego_cross_attn')
+        missing = [key for key in required if not self._ever_nonzero[key]]
+        if missing:
+            raise RuntimeError(
+                'Joint STAC-QM connectivity check found no nonzero gradient '
+                f'for: {missing}')
+        if not self._ever_nonzero['motion_last']:
+            runner.logger.warning(
+                'STAC-QM motion compensator final layer still has zero gradient '
+                'at joint connectivity check; inspect motion candidates before '
+                'the formal run.')
+        self._connectivity_checked = True
+
+    def after_run(self, runner):
+        model = _unwrap_model(runner.model)
+        model._assert_memory_finetune_temporal_state()
+        parameter_digest = _tensor_digest([
+            (name, param) for name, param in model.named_parameters()
+            if not model.is_memory_tuning_parameter(name)
+        ])
+        buffer_digest = _tensor_digest([
+            (name, buffer) for name, buffer in model.named_buffers()
+            if not model.is_memory_tuning_parameter(name)
+        ])
+        if parameter_digest != self._base_parameter_digest:
+            raise RuntimeError(
+                'Frozen parameters changed during joint smoke run')
+        if buffer_digest != self._base_buffer_digest:
+            raise RuntimeError(
+                'Frozen buffers/BN statistics changed during joint smoke run')
+        if not self._connectivity_checked:
+            self._check_connectivity(runner)

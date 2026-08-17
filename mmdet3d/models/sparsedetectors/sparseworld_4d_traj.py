@@ -50,6 +50,25 @@ def Scatter(src_dict):
 
 @DETECTORS.register_module()
 class SparseWorld4DTraj(OPUS):
+    uses_sparseworld_eval_api = True
+    _MEMORY_ONLY_TRAINABLE_PREFIXES = ('query_memory.',)
+    _MEMORY_JOINT_TRAINABLE_PREFIXES = (
+        'query_memory.',
+        'position_encoder.',
+        'reg_branch.',
+        'vel_branch.',
+        'cls_branch.',
+        'ego_cross_attn.',
+    )
+    _MEMORY_JOINT_TRAIN_MODULES = (
+        'query_memory',
+        'position_encoder',
+        'reg_branch',
+        'vel_branch',
+        'cls_branch',
+        'ego_cross_attn',
+    )
+
     def __init__(self,
                  out_dim=32,
                  dataset_type='Nuscenes',
@@ -196,6 +215,12 @@ class SparseWorld4DTraj(OPUS):
         self.memory_enabled = self.query_memory_enabled
         self.memory_finetune_mode = bool(
             self.query_memory_cfg.get('memory_finetune_mode', False))
+        self.memory_joint_finetune_mode = bool(
+            self.query_memory_cfg.get('memory_joint_finetune_mode', False))
+        if self.memory_finetune_mode and self.memory_joint_finetune_mode:
+            raise ValueError(
+                'memory_finetune_mode and memory_joint_finetune_mode are '
+                'mutually exclusive')
         self.query_memory_source = self.query_memory_cfg.get('source', 'cache')
         self.query_memory_frame_interval = float(
             self.query_memory_cfg.get('frame_interval', 0.5))
@@ -266,7 +291,7 @@ class SparseWorld4DTraj(OPUS):
 
     def set_epoch(self, epoch):
         self.curr_epoch = epoch
-        if self.memory_finetune_mode:
+        if self._memory_tuning_active():
             self.pretrain = False
             self.pts_bbox_head.pretrain = False
             self._assert_memory_finetune_temporal_state()
@@ -379,6 +404,7 @@ class SparseWorld4DTraj(OPUS):
             log_diagnostics=False,
             freeze_base_model=False,
             memory_finetune_mode=False,
+            memory_joint_finetune_mode=False,
         )
         user_cfg = query_memory_cfg
         if user_cfg is None:
@@ -410,41 +436,76 @@ class SparseWorld4DTraj(OPUS):
                 DeprecationWarning)
         return user_cfg
 
+    def _memory_tuning_active(self):
+        return bool(
+            getattr(self, 'memory_finetune_mode', False) or
+            getattr(self, 'memory_joint_finetune_mode', False))
+
+    def memory_tuning_trainable_prefixes(self):
+        if getattr(self, 'memory_joint_finetune_mode', False):
+            return self._MEMORY_JOINT_TRAINABLE_PREFIXES
+        if getattr(self, 'memory_finetune_mode', False) or \
+                self.query_memory_cfg.get('freeze_base_model', False):
+            return self._MEMORY_ONLY_TRAINABLE_PREFIXES
+        return tuple()
+
+    def memory_tuning_train_modules(self):
+        if getattr(self, 'memory_joint_finetune_mode', False):
+            return self._MEMORY_JOINT_TRAIN_MODULES
+        if getattr(self, 'memory_finetune_mode', False):
+            return ('query_memory',)
+        return tuple()
+
+    def is_memory_tuning_parameter(self, name):
+        return any(
+            name.startswith(prefix)
+            for prefix in self.memory_tuning_trainable_prefixes())
+
     def _configure_query_memory_trainability(self):
         """Apply one deterministic trainability policy after module creation."""
         freeze_base = bool(
             self.query_memory_cfg.get('freeze_base_model', False))
-        if self.memory_finetune_mode:
+        if getattr(self, 'memory_finetune_mode', False) and getattr(
+                self, 'memory_joint_finetune_mode', False):
+            raise ValueError(
+                'memory_finetune_mode and memory_joint_finetune_mode are '
+                'mutually exclusive')
+        if self._memory_tuning_active():
+            mode_name = (
+                'memory_joint_finetune_mode'
+                if self.memory_joint_finetune_mode
+                else 'memory_finetune_mode')
             if not self.query_memory_enabled or self.query_memory is None:
                 raise ValueError(
-                    'memory_finetune_mode=True requires enabled STAC-QM')
+                    f'{mode_name}=True requires enabled STAC-QM')
             if self.query_memory_source != 'cache':
                 raise ValueError(
-                    'memory_finetune_mode=True requires source="cache"')
+                    f'{mode_name}=True requires source="cache"')
             if not freeze_base:
                 raise ValueError(
-                    'memory_finetune_mode=True requires freeze_base_model=True')
+                    f'{mode_name}=True requires freeze_base_model=True')
 
         if freeze_base:
+            prefixes = self.memory_tuning_trainable_prefixes()
             for name, param in self.named_parameters():
-                param.requires_grad = name.startswith('query_memory.')
+                param.requires_grad = any(
+                    name.startswith(prefix) for prefix in prefixes)
         elif self.query_memory is not None:
             # Preserve the legacy non-finetune policy: query memory is inert unless
-            # the base-freezing / memory-only path is explicitly requested.
+            # the base-freezing path is explicitly requested.
             for param in self.query_memory.parameters():
                 param.requires_grad = False
 
     def train(self, mode=True):
         super().train(mode)
-        if self.memory_finetune_mode and mode:
+        if self._memory_tuning_active() and mode:
             # Keep the root in training mode so MMDetection executes forward_train
-            # and computes losses, but freeze every base child module's runtime
-            # state (BN statistics, dropout, and other train/eval behavior).
+            # and computes losses. Only the explicit tuning modules may change
+            # runtime state; every frozen child remains in eval mode so BN buffers
+            # and dropout behavior stay fixed.
+            train_modules = set(self.memory_tuning_train_modules())
             for name, module in self.named_children():
-                if name == 'query_memory':
-                    module.train(True)
-                else:
-                    module.eval()
+                module.train(name in train_modules)
         return self
 
     def _current_rap_masks(self):
@@ -460,7 +521,7 @@ class SparseWorld4DTraj(OPUS):
         return masks
 
     def _freeze_memory_finetune_temporal_state(self):
-        if not self.memory_finetune_mode:
+        if not self._memory_tuning_active():
             return
         if self.frozen_num_stamps_all is not None:
             self._assert_memory_finetune_temporal_state()
@@ -468,7 +529,7 @@ class SparseWorld4DTraj(OPUS):
         head = self.pts_bbox_head
         if getattr(head, 'num_stamps_all', None) is None:
             raise RuntimeError(
-                'memory_finetune_mode requires pts_bbox_head.num_stamps_all')
+                'Memory tuning requires pts_bbox_head.num_stamps_all')
         num_stamps = head.num_stamps_all.float()
         denominator = num_stamps.sum(dim=-1, keepdim=True)
         if (denominator <= 0).any():
@@ -485,71 +546,176 @@ class SparseWorld4DTraj(OPUS):
         self._frozen_rap_masks = self._current_rap_masks()
 
     def _assert_memory_finetune_temporal_state(self):
-        if not self.memory_finetune_mode:
+        if not self._memory_tuning_active():
             return
         if self.frozen_num_stamps_all is None or \
                 self.frozen_ind_stamps_all is None:
             raise RuntimeError(
-                'Memory-only temporal state was not finalized after checkpoint '
+                'Memory tuning temporal state was not finalized after checkpoint '
                 'loading. Call validate_query_memory_training_setup first.')
         head = self.pts_bbox_head
         if not torch.equal(head.num_stamps_all, self.frozen_num_stamps_all):
-            raise RuntimeError('num_stamps_all changed in memory_finetune_mode')
+            raise RuntimeError('num_stamps_all changed during Memory tuning')
         if not torch.equal(head.ind_stamps_all, self.frozen_ind_stamps_all):
-            raise RuntimeError('ind_stamps_all changed in memory_finetune_mode')
+            raise RuntimeError('ind_stamps_all changed during Memory tuning')
         current_masks = self._current_rap_masks()
         frozen_masks = self._frozen_rap_masks or []
         if len(current_masks) != len(frozen_masks):
-            raise RuntimeError('RAP causal mask count changed in memory_finetune_mode')
+            raise RuntimeError('RAP causal mask count changed during Memory tuning')
         for current, frozen in zip(current_masks, frozen_masks):
             if not torch.equal(current, frozen):
-                raise RuntimeError('RAP causal mask changed in memory_finetune_mode')
+                raise RuntimeError('RAP causal mask changed during Memory tuning')
 
-    def validate_query_memory_training_setup(self, optimizer=None, logger=None):
+    def validate_query_memory_training_setup(
+            self, optimizer=None, optimizer_cfg=None, logger=None):
         if not self.query_memory_enabled:
             return dict(trainable_names=[], trainable_count=0)
-        if self.memory_finetune_mode:
+        if self._memory_tuning_active():
             self._freeze_memory_finetune_temporal_state()
         if self.query_memory_source == 'online' and self.training:
             return dict(trainable_names=[], trainable_count=0)
 
+        named_parameters = list(self.named_parameters())
         trainable = [
-            (name, param) for name, param in self.named_parameters()
+            (name, param) for name, param in named_parameters
             if param.requires_grad
         ]
         trainable_names = [name for name, _ in trainable]
         if self.query_memory_cfg.get('freeze_base_model', False):
+            prefixes = self.memory_tuning_trainable_prefixes()
+            expected = [
+                (name, param) for name, param in named_parameters
+                if any(name.startswith(prefix) for prefix in prefixes)
+            ]
             bad = [
                 name for name in trainable_names
-                if not name.startswith('query_memory.')]
+                if not any(name.startswith(prefix) for prefix in prefixes)
+            ]
+            missing_trainable = [
+                name for name, param in expected if not param.requires_grad
+            ]
             if bad:
                 raise RuntimeError(
-                    'freeze_base_model=True allows only query_memory.* to be '
-                    f'trainable, but found: {bad[:20]}')
+                    'freeze_base_model=True found parameters outside the '
+                    f'allowed tuning scope: {bad[:20]}')
+            if missing_trainable:
+                raise RuntimeError(
+                    'Expected tuning parameters are frozen: '
+                    f'{missing_trainable[:20]}')
             if not trainable:
                 raise RuntimeError(
                     'freeze_base_model=True left no trainable parameters.')
 
-        if self.memory_finetune_mode and optimizer is not None:
-            query_ids = {
-                id(param): name for name, param in self.named_parameters()
-                if name.startswith('query_memory.') and param.requires_grad
-            }
-            optimizer_ids = {
-                id(param)
+        if self._memory_tuning_active() and optimizer is not None:
+            trainable_by_id = {id(param): name for name, param in trainable}
+            all_by_id = {id(param): name for name, param in named_parameters}
+            optimizer_params = [
+                param
                 for group in optimizer.param_groups
                 for param in group['params']
+            ]
+            optimizer_ids = [id(param) for param in optimizer_params]
+            optimizer_id_counts = {}
+            for param_id in optimizer_ids:
+                optimizer_id_counts[param_id] = (
+                    optimizer_id_counts.get(param_id, 0) + 1)
+            optimizer_id_set = set(optimizer_id_counts)
+            duplicate_ids = {
+                param_id for param_id, count in optimizer_id_counts.items()
+                if count != 1
             }
-            unexpected = optimizer_ids - set(query_ids)
-            missing = set(query_ids) - optimizer_ids
-            if unexpected:
+            unexpected_ids = optimizer_id_set - set(trainable_by_id)
+            missing_ids = set(trainable_by_id) - optimizer_id_set
+            if duplicate_ids:
+                duplicate_names = [
+                    all_by_id.get(param_id, f'<unknown:{param_id}>')
+                    for param_id in duplicate_ids
+                ]
                 raise RuntimeError(
-                    'Memory-only optimizer contains non-query-memory parameters')
-            if missing:
-                missing_names = [query_ids[param_id] for param_id in missing]
+                    'Memory tuning optimizer contains duplicate parameters: '
+                    f'{duplicate_names[:20]}')
+            if unexpected_ids:
+                unexpected_names = [
+                    all_by_id.get(param_id, f'<unknown:{param_id}>')
+                    for param_id in unexpected_ids
+                ]
                 raise RuntimeError(
-                    'Memory-only optimizer is missing trainable parameters: '
+                    'Memory tuning optimizer contains frozen or unexpected '
+                    f'parameters: {unexpected_names[:20]}')
+            if missing_ids:
+                missing_names = [
+                    trainable_by_id[param_id] for param_id in missing_ids
+                ]
+                raise RuntimeError(
+                    'Memory tuning optimizer is missing trainable parameters: '
                     f'{missing_names[:20]}')
+
+            if optimizer_cfg is not None:
+                base_lr = optimizer_cfg.get('lr', None)
+                base_wd = optimizer_cfg.get('weight_decay', None)
+                paramwise_cfg = optimizer_cfg.get('paramwise_cfg', {}) or {}
+                custom_keys = paramwise_cfg.get('custom_keys', {})
+                sorted_keys = sorted(
+                    sorted(custom_keys), key=len, reverse=True)
+                optimizer_groups_by_id = {}
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        optimizer_groups_by_id[id(param)] = group
+                lr_scales = []
+                for name, param in trainable:
+                    expected_lr = base_lr
+                    expected_wd = base_wd
+                    for key in sorted_keys:
+                        if key not in name:
+                            continue
+                        if base_lr is not None:
+                            expected_lr = base_lr * custom_keys[key].get(
+                                'lr_mult', 1.0)
+                        if base_wd is not None:
+                            expected_wd = base_wd * custom_keys[key].get(
+                                'decay_mult', 1.0)
+                        break
+                    group = optimizer_groups_by_id[id(param)]
+                    actual_lr = group.get('lr', optimizer.defaults.get('lr'))
+                    actual_wd = group.get(
+                        'weight_decay', optimizer.defaults.get('weight_decay'))
+                    if expected_lr is not None:
+                        # MMCV restores the scheduler-adjusted current LR when
+                        # resuming.  ``initial_lr`` remains the configured LR
+                        # and is therefore the correct absolute value to
+                        # validate.  The current values are checked below via
+                        # their common scheduler scale.
+                        initial_lr = group.get('initial_lr', None)
+                        if initial_lr is not None and not np.isclose(
+                                initial_lr, expected_lr,
+                                rtol=1e-9, atol=1e-12):
+                            raise RuntimeError(
+                                f'Unexpected optimizer initial lr for {name}: '
+                                f'{initial_lr} != {expected_lr}')
+                        if expected_lr == 0:
+                            if not np.isclose(
+                                    actual_lr, 0.0, rtol=0.0, atol=1e-12):
+                                raise RuntimeError(
+                                    f'Unexpected optimizer lr for {name}: '
+                                    f'{actual_lr} != 0')
+                        else:
+                            lr_scales.append((name, actual_lr / expected_lr))
+                    if expected_wd is not None and not np.isclose(
+                            actual_wd, expected_wd, rtol=1e-9, atol=1e-12):
+                        raise RuntimeError(
+                            f'Unexpected optimizer weight decay for {name}: '
+                            f'{actual_wd} != {expected_wd}')
+                if lr_scales:
+                    reference_name, reference_scale = lr_scales[0]
+                    for name, lr_scale in lr_scales[1:]:
+                        if not np.isclose(
+                                lr_scale, reference_scale,
+                                rtol=1e-9, atol=1e-12):
+                            raise RuntimeError(
+                                'Optimizer parameter groups have inconsistent '
+                                'lr scheduler scales: '
+                                f'{name}={lr_scale} vs '
+                                f'{reference_name}={reference_scale}')
 
         trainable_count = sum(param.numel() for _, param in trainable)
         message = (
@@ -557,7 +723,7 @@ class SparseWorld4DTraj(OPUS):
             f'({trainable_count} scalars): {trainable_names}')
         if logger is not None:
             logger.info(message)
-        elif self.memory_finetune_mode:
+        elif self._memory_tuning_active():
             print(message, flush=True)
         return dict(
             trainable_names=trainable_names,
@@ -624,10 +790,10 @@ class SparseWorld4DTraj(OPUS):
             ]
             missing = [key for key in required if key not in kwargs]
             if missing:
-                if self.memory_finetune_mode:
+                if self._memory_tuning_active():
                     raise KeyError(
-                        'memory_finetune_mode requires cache tensors from the '
-                        f'strict loader; missing: {missing}')
+                        'Memory tuning requires cache tensors from the strict '
+                        f'loader; missing: {missing}')
                 return None
             context = dict(
                 memory_query_feat=self._tensor_from_memory_kwargs(
@@ -821,15 +987,15 @@ class SparseWorld4DTraj(OPUS):
         forecast_semantics_list = list()
         pred_trajs_list = list()
         forecast_points_mask_list = list()
-        if self.training and not self.memory_finetune_mode:
+        if self.training and not self._memory_tuning_active():
             num_fu_frames = max(
                 1, min(
                     self.curr_epoch - self.finetune_epoch + 1,
                     self.num_fu_frames))
         else:
-            # Memory-only tuning always trains all configured future horizons
-            # from its first iteration; the original progressive schedule is
-            # retained outside memory_finetune_mode.
+            # Both Memory-only and joint tuning train every configured future
+            # horizon from their first iteration. The original progressive
+            # schedule remains unchanged outside explicit Memory tuning.
             num_fu_frames = self.num_fu_frames
 
         for interval in range(num_fu_frames):

@@ -380,9 +380,13 @@ class _ShapeModule(nn.Module):
 
 
 class _FakeEgoCrossAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+
     def forward(self, query_pos, query_feat, memory_pos, memory_feat):
         del query_pos, memory_pos, memory_feat
-        return query_feat.new_zeros(query_feat.shape), None
+        return query_feat.new_zeros(query_feat.shape) + self.anchor * 0, None
 
 
 class _ForwardHead(nn.Module):
@@ -407,6 +411,7 @@ class _FakeDecoderLayer(nn.Module):
 class _FakeTemporalHead(nn.Module):
     def __init__(self):
         super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
         self.register_buffer('num_stamps_all', torch.tensor([
             [10, 1], [9, 2], [1, 10]], dtype=torch.long))
         self.pretrain = True
@@ -427,7 +432,8 @@ class _FakeTemporalHead(nn.Module):
         self.transformer.decoder.decoder_layers[0].self_attn.ind_mask = mask
 
 
-def _make_sparseworld_shell(memory_finetune_mode=True):
+def _make_sparseworld_shell(memory_finetune_mode=True,
+                            memory_joint_finetune_mode=False):
     from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import \
         SparseWorld4DTraj
 
@@ -435,13 +441,24 @@ def _make_sparseworld_shell(memory_finetune_mode=True):
     nn.Module.__init__(model)
     model.query_memory_enabled = True
     model.memory_finetune_mode = memory_finetune_mode
+    model.memory_joint_finetune_mode = memory_joint_finetune_mode
     model.query_memory_source = 'cache'
     model.query_memory_cfg = dict(
-        freeze_base_model=True, memory_finetune_mode=memory_finetune_mode)
+        freeze_base_model=True,
+        memory_finetune_mode=memory_finetune_mode,
+        memory_joint_finetune_mode=memory_joint_finetune_mode)
     model.query_memory = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.1))
     model.img_backbone = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.1))
     model.img_neck = nn.Linear(4, 4)
     model.pts_bbox_head = _FakeTemporalHead()
+    model.plan_head = nn.Linear(4, 4)
+    model.points_scale_branch = nn.Linear(4, 3)
+    model.traj_head = nn.Linear(4, 2)
+    model.position_encoder = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.1))
+    model.reg_branch = nn.Linear(4, 3)
+    model.vel_branch = nn.Linear(4, 2)
+    model.cls_branch = nn.Linear(4, 17)
+    model.ego_cross_attn = _FakeEgoCrossAttention()
     model.num_query = 2
     model.num_fu_query = [1]
     model.num_fu_frames = 1
@@ -459,7 +476,7 @@ def test_memory_finetune_trainability_optimizer_and_module_modes():
     optimizer = torch.optim.Adam(model.query_memory.parameters(), lr=1e-4)
     summary = model.validate_query_memory_training_setup(optimizer=optimizer)
     bad_optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    with pytest.raises(RuntimeError, match='non-query-memory'):
+    with pytest.raises(RuntimeError, match='frozen or unexpected'):
         model.validate_query_memory_training_setup(optimizer=bad_optimizer)
     assert summary['trainable_names']
     assert all(name.startswith('query_memory.')
@@ -477,6 +494,113 @@ def test_memory_finetune_trainability_optimizer_and_module_modes():
     assert model.query_memory.training is False
 
 
+def test_memory_tuning_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        _make_sparseworld_shell(
+            memory_finetune_mode=True,
+            memory_joint_finetune_mode=True)
+
+
+def test_memory_joint_trainability_optimizer_lrs_and_module_modes():
+    from mmcv.runner import build_optimizer
+    from mmdet3d.core.optimizer import TrainableOnlyOptimizerConstructor  # noqa
+
+    model = _make_sparseworld_shell(
+        memory_finetune_mode=False,
+        memory_joint_finetune_mode=True)
+    model._freeze_memory_finetune_temporal_state()
+    optimizer_cfg = dict(
+        type='AdamW',
+        constructor='TrainableOnlyOptimizerConstructor',
+        lr=1e-5,
+        weight_decay=1e-2,
+        paramwise_cfg=dict(
+            custom_keys={
+                'query_memory': dict(lr_mult=5.0),
+                'ego_cross_attn': dict(lr_mult=0.5),
+            },
+            bypass_duplicate=True))
+    optimizer = build_optimizer(model, optimizer_cfg)
+    summary = model.validate_query_memory_training_setup(
+        optimizer=optimizer, optimizer_cfg=optimizer_cfg)
+    bad_optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    with pytest.raises(RuntimeError, match='frozen or unexpected'):
+        model.validate_query_memory_training_setup(optimizer=bad_optimizer)
+
+    expected_prefixes = model._MEMORY_JOINT_TRAINABLE_PREFIXES
+    assert summary['trainable_names']
+    assert all(any(name.startswith(prefix) for prefix in expected_prefixes)
+               for name in summary['trainable_names'])
+    for prefix in expected_prefixes:
+        assert any(name.startswith(prefix)
+                   for name in summary['trainable_names'])
+
+    named_by_id = {id(param): name for name, param in model.named_parameters()}
+    lrs = {}
+    optimizer_ids = []
+    for group in optimizer.param_groups:
+        for param in group['params']:
+            optimizer_ids.append(id(param))
+            lrs[named_by_id[id(param)]] = group['lr']
+    assert len(optimizer_ids) == len(set(optimizer_ids))
+    assert set(lrs) == set(summary['trainable_names'])
+    assert all(lr == pytest.approx(5e-5)
+               for name, lr in lrs.items()
+               if name.startswith('query_memory.'))
+    assert all(lr == pytest.approx(5e-6)
+               for name, lr in lrs.items()
+               if name.startswith('ego_cross_attn.'))
+    assert all(lr == pytest.approx(1e-5)
+               for name, lr in lrs.items()
+               if not name.startswith(('query_memory.', 'ego_cross_attn.')))
+
+    # A resumed MMCV optimizer carries scheduler-adjusted current LRs.  Their
+    # absolute values differ from the config while the initial LRs and the
+    # relative paramwise multipliers remain valid.
+    scheduler_scale = 0.9829799502313896
+    for group in optimizer.param_groups:
+        group['initial_lr'] = group['lr']
+        group['lr'] *= scheduler_scale
+    model.validate_query_memory_training_setup(
+        optimizer=optimizer, optimizer_cfg=optimizer_cfg)
+
+    optimizer.param_groups[0]['lr'] *= 0.5
+    with pytest.raises(RuntimeError, match='inconsistent lr scheduler scales'):
+        model.validate_query_memory_training_setup(
+            optimizer=optimizer, optimizer_cfg=optimizer_cfg)
+
+    for module_name in ('img_backbone', 'img_neck', 'pts_bbox_head',
+                        'plan_head', 'points_scale_branch', 'traj_head'):
+        assert all(not param.requires_grad
+                   for param in getattr(model, module_name).parameters())
+
+    model.train()
+    assert model.training is True
+    for module_name in model._MEMORY_JOINT_TRAIN_MODULES:
+        assert getattr(model, module_name).training is True
+    for module_name in ('img_backbone', 'img_neck', 'pts_bbox_head',
+                        'plan_head', 'points_scale_branch', 'traj_head'):
+        assert getattr(model, module_name).training is False
+
+    invalid_cfg = dict(
+        type='AdamW',
+        constructor='TrainableOnlyOptimizerConstructor',
+        lr=1e-5,
+        weight_decay=1e-2,
+        paramwise_cfg=dict(norm_decay_mult=0.0))
+    with pytest.raises(ValueError, match='does not support'):
+        build_optimizer(model, invalid_cfg)
+
+
+def test_memory_joint_requires_strict_loader_tensors():
+    model = _make_sparseworld_shell(
+        memory_finetune_mode=False,
+        memory_joint_finetune_mode=True)
+    with pytest.raises(KeyError, match='strict loader'):
+        model._query_memory_context(
+            {}, [], torch.device('cpu'), torch.float32)
+
+
 def test_memory_finetune_requires_strict_loader_tensors():
     model = _make_sparseworld_shell()
     with pytest.raises(KeyError, match='strict loader'):
@@ -484,8 +608,14 @@ def test_memory_finetune_requires_strict_loader_tensors():
             {}, [], torch.device('cpu'), torch.float32)
 
 
-def test_memory_finetune_tass_state_is_frozen_across_epochs():
-    model = _make_sparseworld_shell()
+@pytest.mark.parametrize(
+    'memory_finetune_mode,memory_joint_finetune_mode',
+    [(True, False), (False, True)])
+def test_memory_tuning_tass_state_is_frozen_across_epochs(
+        memory_finetune_mode, memory_joint_finetune_mode):
+    model = _make_sparseworld_shell(
+        memory_finetune_mode=memory_finetune_mode,
+        memory_joint_finetune_mode=memory_joint_finetune_mode)
     model._freeze_memory_finetune_temporal_state()
     frozen_num = model.frozen_num_stamps_all.clone()
     frozen_ind = model.frozen_ind_stamps_all.clone()
@@ -508,8 +638,11 @@ def test_memory_finetune_tass_state_is_frozen_across_epochs():
         model.set_epoch(12)
 
 
+@pytest.mark.parametrize(
+    'memory_finetune_mode,memory_joint_finetune_mode',
+    [(True, False), (False, True)])
 def test_forward_backbone_runtime_reads_seven_groups_and_1040_queries(
-        monkeypatch):
+        monkeypatch, memory_finetune_mode, memory_joint_finetune_mode):
     import mmdet3d.models.sparsedetectors.sparseworld_4d_traj as sw_mod
     SparseWorld4DTraj = sw_mod.SparseWorld4DTraj
     monkeypatch.setattr(sw_mod, 'device', torch.device('cpu'))
@@ -529,7 +662,8 @@ def test_forward_backbone_runtime_reads_seven_groups_and_1040_queries(
         all_cls_scores=[torch.zeros(B, Q, R, 17)])
 
     model.query_memory_enabled = True
-    model.memory_finetune_mode = True
+    model.memory_finetune_mode = memory_finetune_mode
+    model.memory_joint_finetune_mode = memory_joint_finetune_mode
     model.query_memory_log_diagnostics = False
     model.query_memory_frame_interval = 0.5
     model.num_refines = R

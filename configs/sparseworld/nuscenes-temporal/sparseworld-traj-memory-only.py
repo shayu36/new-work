@@ -10,6 +10,9 @@ model = dict(
         freeze_base_model=True,
         log_diagnostics=False))
 
+# Two-GPU formal run: 2 samples per GPU, global batch size 4.
+data = dict(samples_per_gpu=2)
+
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
